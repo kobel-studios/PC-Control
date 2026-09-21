@@ -1,0 +1,27 @@
+﻿{
+    "Tools":  [
+
+              ],
+    "Processes":  [
+                      {
+                          "ProcessId":  15076,
+                          "Name":  "pythonw.exe",
+                          "CommandLine":  "\"C:\\Users\\jacks\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe\" \"C:\\Users\\jacks\\Downloads\\AI Creations\\speech-volume-guard\\windsurf_volume_guard_watcher.py\""
+                      },
+                      {
+                          "ProcessId":  13476,
+                          "Name":  "pythonw.exe",
+                          "CommandLine":  "pythonw  \"C:\\Users\\jacks\\HQ\\media_file_watcher.py\""
+                      },
+                      {
+                          "ProcessId":  13464,
+                          "Name":  "pythonw.exe",
+                          "CommandLine":  "pythonw  \"C:\\Users\\jacks\\VoiceChanger\\code_verifier.py\""
+                      },
+                      {
+                          "ProcessId":  11844,
+                          "Name":  "python.exe",
+                          "CommandLine":  null
+                      }
+                  ]
+}
