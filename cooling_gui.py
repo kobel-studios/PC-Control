@@ -914,9 +914,10 @@ CLEANUP_PROTECTED = frozenset((
     "nvdisplay.container", "nvidia share", "nvidia web helper",
     "msiafterburner", "afterburnerhelper", "rtss", "rtsshooksloader",
     "rtsshooksloader64", "rtsscl",
-    # Ambiguous hosts: this app, the code verifier and other tools run under
-    # python/pythonw names - never auto-close something we cannot identify.
-    "python", "pythonw",
+    # Ambiguous hosts: python/pythonw processes are resolved to script names
+    # before classification; if resolution fails they stay protected. Script
+    # stems below are this app and its helper tooling - never close them.
+    "python", "pythonw", "cooling_gui", "code_verifier", "reopen_helper",
 ))
 CLEANUP_SAFE_CLOSE = frozenset((
     "spotify", "discord", "discordupdate", "discordptb", "discordcanary",
@@ -1288,10 +1289,38 @@ class CoolingApp:
                     rows = []
                     for row in csv.DictReader(io.StringIO(out)):
                         try:
-                            rows.append((row["Name"].strip().lower(),
+                            # WMI appends "#N" for repeated process names; strip it
+                            # so classification and remembered choices match by app.
+                            rows.append((row["Name"].strip().lower().split("#")[0],
                                          int(row["IDProcess"]),
                                          float(row["PercentProcessorTime"])))
                         except (KeyError, ValueError):
+                            pass
+                    # python/pythonw processes all share a name - resolve each to
+                    # its script stem so the user sees e.g. "volume_guard_watcher"
+                    # instead of "python#1". Unresolved ones stay "python"/"pythonw".
+                    if any(name in ("python", "pythonw") for name, _, _ in rows):
+                        try:
+                            out2 = subprocess.run(
+                                ["powershell", "-NoProfile", "-Command",
+                                 "Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^pythonw?\\.exe$'} | "
+                                 "Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation"],
+                                capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                            script_by_pid = {}
+                            for prow in csv.DictReader(io.StringIO(out2)):
+                                try:
+                                    cmd = prow.get("CommandLine") or ""
+                                    script = next((os.path.splitext(os.path.basename(t))[0]
+                                                   for t in cmd.split() if t.lower().endswith(".py")), None)
+                                    if script:
+                                        script_by_pid[int(prow["ProcessId"])] = script.lower()
+                                except (KeyError, ValueError):
+                                    pass
+                            if script_by_pid:
+                                rows = [(script_by_pid.get(pid, name), pid, cpu)
+                                        for name, pid, cpu in rows]
+                        except Exception:
                             pass
                     self.cleanup_candidates = rows
                 except Exception:
