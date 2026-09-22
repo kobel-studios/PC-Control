@@ -117,5 +117,58 @@ class GameBoostTests(unittest.TestCase):
         self.assertFalse(booster.timer_raised)
 
 
+class GpuFanTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.root = make_app()
+
+    def tearDown(self):
+        teardown(self.app, self.root)
+
+    def use_nvapi(self):
+        backend = Mock(spec=gui.NvApiControl)
+        backend.gpu = 1
+        backend.power_raised = False
+        self.app.nvapi = backend
+        return backend
+
+    def test_fan_full_when_hot(self):
+        backend = self.use_nvapi()
+        self.app.gpu_data = {"temp": 80}
+        self.app.tick_gpu_fan()
+        backend.set_fan.assert_called_once_with(100)
+        self.assertTrue(self.app.gpu_fan_manual)
+
+    def test_fan_auto_when_cool_again(self):
+        backend = self.use_nvapi()
+        self.app.gpu_data = {"temp": 80}
+        self.app.tick_gpu_fan()
+        self.app.gpu_data = {"temp": 65}
+        self.app.tick_gpu_fan()
+        backend.set_fan.assert_called_with(None)
+        self.assertFalse(self.app.gpu_fan_manual)
+
+    def test_fan_hysteresis(self):
+        backend = self.use_nvapi()
+        self.app.gpu_data = {"temp": 80}
+        self.app.tick_gpu_fan()
+        self.app.gpu_data = {"temp": 73}
+        self.app.tick_gpu_fan()
+        self.assertEqual(backend.set_fan.call_count, 1)
+        self.assertTrue(self.app.gpu_fan_manual)
+
+    def test_fan_ignored_on_afterburner(self):
+        self.app.nvapi = None
+        self.app.gpu_data = {"temp": 80}
+        self.app.tick_gpu_fan()
+        self.assertFalse(self.app.gpu_fan_manual)
+
+    def test_power_raised_with_offsets(self):
+        backend = self.use_nvapi()
+        self.app.gpu_managed_offsets = (55.0, 106.0)
+        self.app.gpu_data = {"temp": 50}
+        self.app.tick_gpu_fan()
+        backend.set_power.assert_called_once_with(True)
+
+
 if __name__ == "__main__":
     unittest.main()
