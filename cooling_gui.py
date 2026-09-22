@@ -920,12 +920,14 @@ CLEANUP_PROTECTED = frozenset((
     "python", "pythonw", "cooling_gui", "code_verifier", "reopen_helper",
 ))
 CLEANUP_SAFE_CLOSE = frozenset((
-    "spotify", "discord", "discordupdate", "discordptb", "discordcanary",
-    "opera", "operagx", "chrome", "msedge", "firefox", "brave", "vivaldi",
-    "robloxplayerbeta", "epicgameslauncher", "steamwebhelper", "steamservice",
-    "onedrive", "dropbox", "overwolf", "overwolfbrowser", "updater",
-    "crashpad", "qtaudio", "obs-browser-page", "msedgewebview2",
+    "spotify", "opera", "operagx", "chrome", "msedge", "firefox", "brave",
+    "vivaldi", "robloxplayerbeta", "epicgameslauncher", "steamwebhelper",
+    "steamservice", "onedrive", "dropbox", "overwolf", "overwolfbrowser",
+    "updater", "crashpad", "qtaudio", "obs-browser-page", "msedgewebview2",
 ))
+# Ask-first: could be in active use during a game (voice chat, etc.)
+# - discord*, overlays, recording/streaming tools land here naturally since
+#   they are not on the safe list and not protected.
 CLEANUP_CPU_MIN = 25.0  # PercentProcessorTime above this = worth closing
 CLEANUP_RECLOSE_AFTER = 120.0  # respawned apps can be closed again after this
 TIMER_RES_100NS = 5000  # 0.5 ms
