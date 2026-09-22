@@ -905,6 +905,15 @@ CLEANUP_PROTECTED = frozenset((
     "secure system", "system idle process", "idle", "consent", "sihost",
     "ctfmon", "taskmgr", "msmpeng", "securityhealthservice", "gamemon",
     "gamemon.des", "easyanticheat", "beservice", "vgtray", "vgc",
+    # Antivirus / VPN: killing these can drop the whole connection
+    # (VPN kill switches) or leave security in a broken state.
+    "vpnsvc", "nortonui", "nortonsecurity", "wsc_proxy", "nav",
+    "aswidsagent", "aswidsagenta", "avastui", "avastsvc", "avast",
+    "aswengsrv", "mbamservice", "mbamtray", "mcshield", "mfemms",
+    "bdagent", "avguard", "ekrn", "avp", "savservice", "sophoshealth",
+    "openvpn", "openvpnserv", "wireguard", "nordvpn-service", "expressvpn",
+    "expressvpnd", "tailscaled", "zerotier-one_x64", "zerotier", "wgtunnel",
+    "cfwhelper", "clash", "v2ray", "protonvpn", "psiphon3",
     # Windows shell / security: closing these breaks the desktop or AV.
     "explorer", "shellexperiencehost", "startmenuexperiencehost", "searchhost",
     "searchui", "runtimebroker", "applicationframehost", "dllhost", "conhost",

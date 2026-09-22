@@ -40,7 +40,8 @@ class FpsCleanupTests(unittest.TestCase):
 
     def test_protected_process_never_touched(self):
         self.app.cleanup_candidates = [("explorer", 333, 80.0), ("svchost", 334, 50.0),
-                                       ("cooling_gui", 335, 90.0), ("code_verifier", 336, 60.0)]
+                                       ("cooling_gui", 335, 90.0), ("code_verifier", 336, 60.0),
+                                       ("vpnsvc", 337, 70.0), ("aswidsagent", 338, 70.0)]
         self.scan()
         self.app._cleanup_close.assert_not_called()
         self.assertEqual(self.app.cleanup_queue, [])
