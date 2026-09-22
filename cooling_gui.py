@@ -929,10 +929,22 @@ CLEANUP_PROTECTED = frozenset((
     "python", "pythonw", "cooling_gui", "code_verifier", "reopen_helper",
 ))
 CLEANUP_SAFE_CLOSE = frozenset((
+    # Media/browsers - restartable, tabs restore, no unsaved work.
     "spotify", "opera", "operagx", "chrome", "msedge", "firefox", "brave",
-    "vivaldi", "robloxplayerbeta", "epicgameslauncher", "steamwebhelper",
-    "steamservice", "onedrive", "dropbox", "overwolf", "overwolfbrowser",
-    "updater", "crashpad", "qtaudio", "obs-browser-page", "msedgewebview2",
+    "vivaldi", "robloxplayerbeta", "msedgewebview2",
+    # Other game launchers/helpers - the running game only needs Steam itself.
+    "epicgameslauncher", "steamwebhelper", "steamservice", "eadesktop",
+    "ealauncher", "origin", "originwebhelperservice", "ubisoftconnect", "upc",
+    "battle.net", "galaxyclient", "wegame", "riotclientservices",
+    # Cloud sync + update/telemetry junk - nothing user-facing is lost.
+    "onedrive", "dropbox", "googledrivefs", "updater", "crashpad",
+    "googleupdate", "adobearm", "jusched", "adobecollabsync", "ccxprocess",
+    "cclibrary", "adobegcclient", "adobeipcbroker", "core.sync",
+    "ituneshelper", "applemobiledeviceservice", "mdnsresponder", "bonjour",
+    "qtaudio", "obs-browser-page",
+    # Windows Search indexer - a classic background CPU hog during games;
+    # Windows restarts it on its own and nothing is lost by closing it.
+    "searchindexer", "searchprotocolhost", "searchfilterhost",
 ))
 # Ask-first: could be in active use during a game (voice chat, etc.)
 # - discord*, overlays, recording/streaming tools land here naturally since
@@ -1067,6 +1079,7 @@ class CoolingApp:
         self.cleanup_closed = {}
         self.cleanup_always = set()
         self.cleanup_never = set()
+        self.cleanup_desc = {}
         self.running_procs = {}
         self.proc_last_scan = 0
         self.prev_power_scheme = None
@@ -1333,6 +1346,25 @@ class CoolingApp:
                                         for name, pid, cpu in rows]
                         except Exception:
                             pass
+                    # Friendly "what is this" text for the ask dialog: the exe's
+                    # own file description (e.g. chrome -> "Google Chrome").
+                    if rows:
+                        try:
+                            out3 = subprocess.run(
+                                ["powershell", "-NoProfile", "-Command",
+                                 "Get-Process | Select-Object Id,Description | ConvertTo-Csv -NoTypeInformation"],
+                                capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                            desc = {}
+                            for drow in csv.DictReader(io.StringIO(out3)):
+                                try:
+                                    if drow.get("Description"):
+                                        desc[int(drow["Id"])] = drow["Description"].strip()
+                                except (KeyError, ValueError):
+                                    pass
+                            self.cleanup_desc = desc
+                        except Exception:
+                            pass
                     self.cleanup_candidates = rows
                 except Exception:
                     pass
@@ -1527,8 +1559,9 @@ class CoolingApp:
         self.fps_cleanup_status = ttk.Label(game, text="off - frees CPU for the listed game",
                                             wraplength=720)
         self.fps_cleanup_status.pack(anchor="w", padx=12, pady=(0, 4))
-        ttk.Label(game, text="While a listed game runs: closes known background hogs automatically, and asks\n"
-            "before closing anything that might be important. 'Always close' and 'never' answers are remembered.",
+        ttk.Label(game, text="While a listed game runs: automatically closes background junk (browsers, launchers,\n"
+            "sync tools, updaters, search indexing) that is eating CPU. It asks before closing anything that might\n"
+            "matter to you - 'always close'/'never' are remembered, 'leave it' just means not right now.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
 
     def stop_components(self, reason):
@@ -2560,6 +2593,9 @@ class CoolingApp:
             self.fps_cleanup_status.config(text="off - frees CPU for the listed game")
             return
         if not gaming:
+            # "Leave it" answers re-arm next session - some apps are wanted
+            # open sometimes but not every time.
+            self.cleanup_asked.clear()
             self.fps_cleanup_status.config(text="watching for a listed game...")
             return
         protected = CLEANUP_PROTECTED | self.cleanup_never | self._cleanup_game_names()
@@ -2612,7 +2648,11 @@ class CoolingApp:
         dlg.attributes("-topmost", True)
         dlg.configure(bg="#1e1f24")
         cpu_pct = min(100.0, cpu / max(1, os.cpu_count() or 1))
-        ttk.Label(dlg, text=f'"{name}" is using about {cpu_pct:.0f}% of your CPU while your game is running.\n'
+        desc = self.cleanup_desc.get(pid, "").strip()
+        if desc.lower() in ("python", "pythonw"):
+            desc = "Python script"  # name is already the resolved script stem
+        shown = f"{desc} ({name})" if desc and desc.lower() != name else name
+        ttk.Label(dlg, text=f'"{shown}" is using about {cpu_pct:.0f}% of your CPU while your game is running.\n'
                             "Close it to free resources?",
                   wraplength=360).pack(padx=16, pady=(14, 8))
         row = ttk.Frame(dlg)

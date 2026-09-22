@@ -112,6 +112,14 @@ class FpsCleanupTests(unittest.TestCase):
         self.app._cleanup_close.assert_not_called()
         self.assertNotIn("someapp", self.app.cleanup_never)
 
+    def test_asks_rearm_between_sessions(self):
+        self.app.cleanup_candidates = [("someapp", 222, 40.0)]
+        self.scan()
+        self.assertIn("someapp", self.app.cleanup_asked)
+        self.app.boosting_games = set()
+        self.scan(101.0)  # game ended
+        self.assertNotIn("someapp", self.app.cleanup_asked)
+
     def test_reclose_after_respawn_window(self):
         self.app.cleanup_closed["spotify"] = 0.0
         self.app.cleanup_candidates = [("spotify", 111, 60.0)]
