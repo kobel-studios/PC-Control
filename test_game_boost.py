@@ -1,0 +1,121 @@
+"""Game boost tests: mocked process list and booster, no real priority changes."""
+import sys
+import unittest
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, __file__.rsplit("\\", 1)[0])
+import cooling_gui as gui
+
+
+def make_app():
+    import tkinter as tk
+    from tkinter import ttk
+    gui.tk, gui.ttk = tk, ttk
+    root = tk.Tk()
+    root.withdraw()
+    with patch.object(gui.CoolingApp, "open_hardware"), \
+            patch.object(gui.CoolingApp, "load_config"), \
+            patch.object(gui.CoolingApp, "connect_cpu_backend"), \
+            patch.object(gui.threading, "Thread"):
+        app = gui.CoolingApp(root)
+    app.game_booster = Mock()
+    app.game_booster.timer_raised = False
+    app.game_booster.denied = set()
+    return app, root
+
+
+def teardown(app, root):
+    for callback in root.tk.splitlist(root.tk.call("after", "info")):
+        root.after_cancel(callback)
+    root.destroy()
+
+
+class GameBoostTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.root = make_app()
+        self.app.running_procs = {}
+        self.app.game_exes_var.set("helldivers2.exe")
+
+    def tearDown(self):
+        teardown(self.app, self.root)
+
+    def test_boosts_listed_game(self):
+        self.app.game_boost_value.set(True)
+        self.app.running_procs = {"helldivers2.exe": [1234]}
+        with patch.object(self.app, "_apply_power_scheme") as scheme:
+            self.app.tick_game(0)
+        self.app.game_booster.apply.assert_called_once_with([1234])
+        scheme.assert_called_once()
+        self.assertIn("helldivers2.exe", self.app.boosting_games)
+
+    def test_no_boost_when_disabled(self):
+        self.app.running_procs = {"helldivers2.exe": [1234]}
+        self.app.tick_game(0)
+        self.app.game_booster.apply.assert_not_called()
+
+    def test_no_match_keeps_watching(self):
+        self.app.game_boost_value.set(True)
+        self.app.running_procs = {"notepad.exe": [55]}
+        self.app.tick_game(0)
+        self.app.game_booster.apply.assert_not_called()
+        self.assertEqual(self.app.boosting_games, set())
+
+    def test_releases_when_game_exits(self):
+        self.app.game_boost_value.set(True)
+        self.app.running_procs = {"helldivers2.exe": [1234]}
+        with patch.object(self.app, "_apply_power_scheme"):
+            self.app.tick_game(0)
+        self.app.running_procs = {}
+        self.app.game_booster.timer_raised = True
+        with patch.object(self.app, "_restore_power_scheme") as restore:
+            self.app.tick_game(1)
+        self.app.game_booster.release.assert_called_once()
+        restore.assert_called_once()
+
+    def test_toggle_off_releases(self):
+        self.app.game_boost_value.set(True)
+        self.app.tick_game(0)
+        self.app.game_boost_value.set(False)
+        self.app.on_game_boost_toggle()
+        self.app.game_booster.release.assert_called()
+
+    def test_denied_processes_reported(self):
+        self.app.game_boost_value.set(True)
+        self.app.running_procs = {"helldivers2.exe": [1234]}
+        self.app.game_booster.denied = {1234}
+        with patch.object(self.app, "_apply_power_scheme"):
+            self.app.tick_game(0)
+        self.assertIn("anti-cheat", self.app.game_boost_status.cget("text"))
+
+    def test_booster_apply_raises_timer_and_priority(self):
+        booster = gui.GameBooster()
+        booster.k32 = Mock()
+        booster.ntdll = Mock()
+        booster.k32.OpenProcess.return_value = 99
+        booster.apply([1234])
+        booster.ntdll.NtSetTimerResolution.assert_called_once()
+        booster.k32.SetPriorityClass.assert_called_once_with(99, gui.HIGH_PRIORITY_CLASS)
+        booster.k32.CloseHandle.assert_called_with(99)
+
+    def test_booster_denied_when_open_fails(self):
+        booster = gui.GameBooster()
+        booster.k32 = Mock()
+        booster.ntdll = Mock()
+        booster.k32.OpenProcess.return_value = 0
+        booster.apply([1234])
+        self.assertIn(1234, booster.denied)
+        booster.k32.SetPriorityClass.assert_not_called()
+
+    def test_booster_release_restores(self):
+        booster = gui.GameBooster()
+        booster.k32 = Mock()
+        booster.ntdll = Mock()
+        booster.k32.OpenProcess.return_value = 99
+        booster.apply([1234])
+        booster.release()
+        booster.k32.SetPriorityClass.assert_called_with(99, gui.NORMAL_PRIORITY_CLASS)
+        self.assertFalse(booster.timer_raised)
+
+
+if __name__ == "__main__":
+    unittest.main()

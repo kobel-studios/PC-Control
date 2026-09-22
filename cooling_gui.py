@@ -8,8 +8,10 @@ motherboard control restored on exit. Requires admin (self-elevates).
 """
 import csv
 import ctypes
+import io
 import json
 import math
+import re
 import os
 import queue
 import shutil
@@ -751,6 +753,64 @@ class AutoGpuPolicy:
         return None
 
 
+HIGH_PRIORITY_CLASS = 0x00000080
+NORMAL_PRIORITY_CLASS = 0x00000020
+PROCESS_SET_INFORMATION = 0x0200
+HIGH_PERF_SCHEME = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+TIMER_RES_100NS = 5000  # 0.5 ms
+
+
+class GameBooster:
+    """High process priority + fast system timer while a listed game runs.
+
+    Best-effort: anti-cheat protected processes may refuse the priority
+    change; the timer boost still applies system-wide.
+    """
+    def __init__(self):
+        self.boosted = set()
+        self.denied = set()
+        self.timer_raised = False
+        try:
+            self.k32 = ctypes.WinDLL("kernel32")
+            self.ntdll = ctypes.WinDLL("ntdll")
+        except Exception:
+            self.k32 = self.ntdll = None
+
+    def _timer(self, raise_it):
+        cur = ctypes.c_ulong(0)
+        self.ntdll.NtSetTimerResolution(TIMER_RES_100NS, raise_it, ctypes.byref(cur))
+        self.timer_raised = raise_it
+
+    def _set_priority(self, pid, level):
+        handle = self.k32.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            return bool(self.k32.SetPriorityClass(handle, level))
+        finally:
+            self.k32.CloseHandle(handle)
+
+    def apply(self, pids):
+        if not self.k32:
+            return
+        if not self.timer_raised:
+            self._timer(True)
+        for pid in pids:
+            if pid in self.boosted or pid in self.denied:
+                continue
+            (self.boosted if self._set_priority(pid, HIGH_PRIORITY_CLASS) else self.denied).add(pid)
+
+    def release(self):
+        if not self.k32:
+            return
+        for pid in list(self.boosted):
+            self._set_priority(pid, NORMAL_PRIORITY_CLASS)
+        self.boosted.clear()
+        self.denied.clear()
+        if self.timer_raised:
+            self._timer(False)
+
+
 class CoolingApp:
     def __init__(self, root):
         self.root = root
@@ -803,6 +863,13 @@ class CoolingApp:
         self.oc_last_event_check = 0
         self.oc_error_events = 0
         self.tune_status = tk.StringVar(value="")
+        self.game_boost_value = tk.BooleanVar(value=False)
+        self.game_exes_var = tk.StringVar(value="helldivers2.exe")
+        self.game_booster = GameBooster()
+        self.boosting_games = set()
+        self.running_procs = {}
+        self.proc_last_scan = 0
+        self.prev_power_scheme = None
         self.cpu_ratio_preset = CPU_OC_DEFAULT_RATIO
         self.cpu_ratio_from_config = False
         self.cpu_stock_ratio = 38
@@ -861,6 +928,10 @@ class CoolingApp:
             if isinstance(ratio, int) and 0 < ratio <= CPU_OC_MAX_RATIO:
                 self.cpu_ratio_preset = ratio
                 self.cpu_ratio_from_config = True
+            self.game_boost_value.set(bool(cfg.get("game_boost", False)))
+            exes = cfg.get("game_exes")
+            if isinstance(exes, str) and exes.strip():
+                self.game_exes_var.set(exes)
             preset = cfg.get("gpu_auto_preset")
             self.gpu_auto_preset = preset if valid_auto_preset(preset) else None
             if self.gpu_auto_preset:
@@ -884,7 +955,9 @@ class CoolingApp:
                            "manual_values": self.manual_values,
                            "auto": self.auto_mode.get(),
                            "gpu_auto_preset": self.gpu_auto_preset,
-                           "cpu_ratio_preset": self.cpu_ratio_preset}, f)
+                           "cpu_ratio_preset": self.cpu_ratio_preset,
+                           "game_boost": self.game_boost_value.get(),
+                           "game_exes": self.game_exes_var.get()}, f)
         except Exception:
             pass
 
@@ -968,6 +1041,19 @@ class CoolingApp:
                         capture_output=True, text=True, timeout=20,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     self.oc_error_events += int(out.stdout.strip() or 0)
+                except Exception:
+                    pass
+            if time.monotonic() - self.proc_last_scan >= 5:
+                self.proc_last_scan = time.monotonic()
+                try:
+                    out = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                                         capture_output=True, text=True, timeout=15,
+                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                    procs = {}
+                    for row in csv.reader(io.StringIO(out)):
+                        if len(row) >= 2 and row[1].isdigit():
+                            procs.setdefault(row[0].lower(), []).append(int(row[1]))
+                    self.running_procs = procs
                 except Exception:
                     pass
             self.stop_flag.wait(1)
@@ -1136,6 +1222,23 @@ class CoolingApp:
                                         font=("Segoe UI", 11, "bold"))
         self.oc_benefit_label.pack(anchor="w", padx=12, pady=(0, 8))
         ttk.Label(gpu, textvariable=self.tune_status, wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
+
+        game = ttk.LabelFrame(panel, text=" Gaming ")
+        game.pack(fill="x", padx=16, pady=8)
+        grow = ttk.Frame(game)
+        grow.pack(fill="x", padx=8, pady=6)
+        ToggleSwitch(grow, text="Game boost", variable=self.game_boost_value,
+                     command=self.on_game_boost_toggle).pack(side="left")
+        ttk.Label(grow, text="Game .exe names:").pack(side="left", padx=(18, 4))
+        ttk.Entry(grow, textvariable=self.game_exes_var, width=38).pack(side="left")
+        self.game_exes_var.trace_add("write", lambda *a: self.save_config())
+        self.game_boost_status = ttk.Label(game, text="off - boosts the listed game while it runs",
+                                           wraplength=720)
+        self.game_boost_status.pack(anchor="w", padx=12, pady=(0, 4))
+        ttk.Label(game, text="While a listed game runs: sets it to High CPU priority, speeds up the Windows\n"
+            "timer, and keeps the High Performance power plan active. Helps frame pacing; expect small gains.\n"
+            "Anti-cheat games (e.g. Helldivers 2) may block the priority change - the timer boost still applies.",
+            wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
 
     def stop_components(self, reason):
         self.component_session = False
@@ -1986,6 +2089,10 @@ class CoolingApp:
         except Exception:
             pass
         try:
+            self.tick_game(time.monotonic())
+        except Exception:
+            pass
+        try:
             now = time.monotonic()
             cpu_clk = self.snapshot.get("cpu_clock")
             if now - self.snapshot.get("updated_at", 0) > SENSOR_TIMEOUT:
@@ -2033,7 +2140,69 @@ class CoolingApp:
         if not self.stop_flag.is_set():
             self.root.after(1000, self.tick)
 
+    def on_game_boost_toggle(self):
+        self.save_config()
+        if not self.game_boost_value.get():
+            self.boosting_games = set()
+            self.game_booster.release()
+            self._restore_power_scheme()
+            self.game_boost_status.config(text="off - boosts the listed game while it runs")
+        else:
+            self.game_boost_status.config(text="watching for a listed game...")
+
+    def _apply_power_scheme(self):
+        try:
+            out = subprocess.run(["powercfg", "/getactivescheme"], capture_output=True,
+                                 text=True, timeout=10,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            m = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", out)
+            self.prev_power_scheme = m.group(0) if m else None
+            if self.prev_power_scheme != HIGH_PERF_SCHEME:
+                subprocess.run(["powercfg", "/setactive", HIGH_PERF_SCHEME], timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+
+    def _restore_power_scheme(self):
+        try:
+            if self.prev_power_scheme and self.prev_power_scheme != HIGH_PERF_SCHEME:
+                subprocess.run(["powercfg", "/setactive", self.prev_power_scheme], timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+        self.prev_power_scheme = None
+
+    def tick_game(self, now):
+        enabled = self.game_boost_value.get()
+        wanted = {n.strip().lower() for n in self.game_exes_var.get().split(",") if n.strip()}
+        matched = {}
+        if enabled and wanted:
+            for name in wanted:
+                pids = self.running_procs.get(name)
+                if pids:
+                    matched[name] = pids
+        if matched:
+            if not self.boosting_games:
+                self._apply_power_scheme()
+            self.game_booster.apply([p for ps in matched.values() for p in ps])
+            self.boosting_games = set(matched)
+            txt = ("boosting " + ", ".join(sorted(matched))
+                   + " - high priority + fast timer + high perf plan")
+            if self.game_booster.denied:
+                txt += f" ({len(self.game_booster.denied)} protected by anti-cheat)"
+            self.game_boost_status.config(text=txt)
+        else:
+            if self.boosting_games or self.game_booster.timer_raised:
+                self.boosting_games = set()
+                self.game_booster.release()
+                self._restore_power_scheme()
+            self.game_boost_status.config(
+                text="watching for a listed game..." if enabled
+                else "off - boosts the listed game while it runs")
+
     def on_close(self):
+        self.game_booster.release()
+        self._restore_power_scheme()
         self.stop_components("Closing: overclock requests off")
         if self.cpu_oc_active:
             self.cpu_reset("Closing: restoring stock CPU ratio limit")
