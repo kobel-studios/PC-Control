@@ -155,7 +155,7 @@ class ApplyFailureDisarmsAuto(unittest.TestCase):
             self.app.submit_gpu()
         confirm.assert_not_called()
         worker.assert_not_called()
-        self.assertIn("Verify/reset", self.app.gpu_notice.get())
+        self.assertIn("Reset clock offsets", self.app.gpu_notice.get())
 
 
 class ExternalOffsetChangesDisarmAuto(unittest.TestCase):

@@ -8,6 +8,7 @@ motherboard control restored on exit. Requires admin (self-elevates).
 """
 import csv
 import ctypes
+import glob
 import io
 import json
 import math
@@ -96,9 +97,10 @@ def gpu_apply_problem(cpu, gpu, info, now):
         if value >= limit:
             return f"Let the {label} cool below {limit * 9 / 5 + 32:.0f} F before applying an overclock"
     if info.get("command"):
-        return "Afterburner is processing another command"
+        return "GPU clock service is processing another command"
     if info.get("flags", 0) & 0x40000:
-        return "Custom voltage/frequency curves must be managed in Afterburner"
+        return ("A custom GPU voltage/frequency curve is active; PC Control never "
+                "changes voltage - reset GPU settings to stock first")
     return None
 
 ROLE_NAMES = ["Unused", "Liquid Cooling", "Case Fans"]
@@ -136,24 +138,24 @@ MEMORY_OFFSET = 51 * 4
 
 def macm_layout(data):
     if len(data) < 36:
-        raise RuntimeError("Afterburner control header is incomplete")
+        raise RuntimeError("GPU clock service header is incomplete")
     signature, version, header, count, entry, master, flags, stamp, command = struct.unpack_from("<9I", data)
     if signature != MACM_SIGNATURE or not 0x20000 <= version <= 0x20003:
-        raise RuntimeError("Afterburner control interface is not initialized or has an unsupported version")
+        raise RuntimeError("GPU clock service is not initialized or has an unsupported version")
     if count != 1 or master != 0:
-        raise RuntimeError("GPU tuning currently requires exactly one Afterburner GPU")
+        raise RuntimeError("GPU tuning currently requires exactly one GPU")
     if not 36 <= header <= 4096 or not 220 <= entry <= 65536:
-        raise RuntimeError("Invalid Afterburner control layout")
+        raise RuntimeError("Invalid GPU clock service layout")
     return header, entry, command
 
 
 def decode_macm(data):
     header, entry_size, command = macm_layout(data)
     if len(data) < header + entry_size:
-        raise RuntimeError("Afterburner GPU entry is incomplete")
+        raise RuntimeError("GPU clock service entry is incomplete")
     flags = struct.unpack_from("<I", data, header)[0]
     if flags & 0x1800 != 0x1800:
-        raise RuntimeError("Afterburner does not expose both GPU clock-offset controls")
+        raise RuntimeError("GPU clock service does not expose both clock-offset controls")
     core = struct.unpack_from("<4i", data, header + CORE_OFFSET)
     memory = struct.unpack_from("<4i", data, header + MEMORY_OFFSET)
     for current, lower, upper, default in (core, memory):
@@ -173,7 +175,7 @@ class MacmMemory:
 
     def __enter__(self):
         if sys.platform != "win32":
-            raise RuntimeError("Afterburner control is only available on Windows")
+            raise RuntimeError("GPU clock service is only available on Windows")
         from ctypes import wintypes as wt
         self.api = ctypes.WinDLL("kernel32", use_last_error=True)
         signatures = {
@@ -192,7 +194,7 @@ class MacmMemory:
         try:
             self.handle = self.api.OpenFileMappingW(access, False, "MACMSharedMemory")
             if not self.handle:
-                raise RuntimeError("Open MSI Afterburner as administrator to connect GPU controls")
+                raise RuntimeError("GPU clock service is not running yet")
             self.mutex = self.api.CreateMutexW(None, False, "Global\\Access_MACMSharedMemory")
             if not self.mutex:
                 raise ctypes.WinError(ctypes.get_last_error())
@@ -216,10 +218,10 @@ class MacmMemory:
     def lock(self):
         result = self.api.WaitForSingleObject(self.mutex, 1000)
         if result not in (0, 0x80):
-            raise RuntimeError("Afterburner control interface is busy")
+            raise RuntimeError("GPU clock service is busy")
         try:
             if result == 0x80:
-                raise RuntimeError("Afterburner control mutex was abandoned; restart Afterburner")
+                raise RuntimeError("GPU clock service mutex was abandoned; restart PC Control")
             yield
         finally:
             self.api.ReleaseMutex(self.mutex)
@@ -339,7 +341,8 @@ class CpuOcBackend:
         self.blob = blob
 
     def _read(self, addr):
-        if addr not in (OC_MAILBOX_ADDR, MSR_TURBO_RATIO_LIMIT, MSR_RAPL_POWER_UNIT, MSR_PKG_POWER_LIMIT):
+        if addr not in (OC_MAILBOX_ADDR, MSR_TURBO_RATIO_LIMIT, MSR_RAPL_POWER_UNIT,
+                        MSR_PKG_POWER_LIMIT, 0x1A2, 0x1B1, 0x19C):
             raise RuntimeError("CPU backend reads only whitelisted registers")
         in_buf = (ctypes.c_ulonglong * 1)(addr)
         out_buf = (ctypes.c_ulonglong * 1)(0)
@@ -452,6 +455,14 @@ class CpuOcBackend:
         if self._read(MSR_PKG_POWER_LIMIT) != raw:
             raise RuntimeError("Power-limit restore failed")
 
+    def package_temp(self):
+        """CPU package temperature in Celsius via thermal MSRs (any Intel CPU)."""
+        tjmax = (self._read(0x1A2) >> 16) & 0xFF
+        offset = (self._read(0x1B1) >> 16) & 0x7F
+        if not tjmax or offset >= tjmax:
+            return None
+        return float(tjmax - offset)
+
     def close(self):
         if self.lib is not None and self.handle:
             try:
@@ -465,8 +476,8 @@ class GpuSettingsChangedError(RuntimeError):
     pass
 
 
-NVAPI_BUFFER_U32 = 1658  # NV_GPU_PSTATES20_V2: 5 + 16*102 + 21 u32 = 6632 bytes
-NVAPI_VERSION = 6632 | (2 << 16)
+NVAPI_BUFFER_U32 = 1854  # NV_GPU_PSTATES20_V2: 5 + 16*114 + 25 u32 = 7416 bytes
+NVAPI_VERSION = 7416 | (2 << 16)
 NV_CLOCK_GRAPHICS = 0
 NV_CLOCK_MEMORY = 4
 
@@ -514,7 +525,20 @@ class NvApiControl:
         self.power_get = self._fn(0x70916171, ctypes.c_void_p, ctypes.c_void_p)
         self.power_set = self._fn(0xAD95F5ED, ctypes.c_void_p, ctypes.c_void_p)
         self.power_raised = False
-        self.read()
+        self.cooler_get = self._fn(0xDA141340, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p)
+        self.cooler_set = self._fn(0x891FA0AE, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p)
+        self.fan_default = None
+        self.clock_ok = False
+        try:
+            self.read()
+            # Probe write support with a no-op write of the unchanged buffer.
+            # Some drivers accept reads but reject clock writes entirely
+            # (NVAPI_NOT_SUPPORTED); those must fall back instead of failing
+            # mid-apply.
+            buf = self._get()
+            self.clock_ok = self.set_pstates(self.gpu, buf) == 0
+        except Exception:
+            pass
 
     def _power_info(self):
         buf = (ctypes.c_uint32 * 46)()
@@ -551,6 +575,37 @@ class NvApiControl:
             raise RuntimeError(f"SetPowerPoliciesStatus failed (status {status})")
         self.power_raised = raise_to_max
 
+    def cooler_settings(self):
+        buf = (ctypes.c_int32 * 242)()
+        buf[0] = 968 | (2 << 16)
+        status = self.cooler_get(self.gpu, 0, buf)
+        if status != 0:
+            raise RuntimeError(f"GetCoolerSettings failed ({status})")
+        return [{"level": buf[2 + i * 12 + 6], "policy": buf[2 + i * 12 + 8],
+                 "min": buf[2 + i * 12 + 4], "max": buf[2 + i * 12 + 5]}
+                for i in range(min(buf[1], 20))]
+
+    def set_fan(self, level):
+        """level 0-100 sets the GPU fan manually; None restores the card's policy."""
+        coolers = self.cooler_settings()
+        if not coolers:
+            return
+        if self.fan_default is None:
+            self.fan_default = coolers
+        buf = (ctypes.c_int32 * 41)()
+        buf[0] = 164 | (1 << 16)
+        for i in range(20):
+            d = self.fan_default[i] if i < len(self.fan_default) else {"level": 0, "policy": 0x20}
+            if i < len(coolers) and level is not None:
+                buf[1 + i * 2] = max(0, min(100, int(level)))
+                buf[2 + i * 2] = 1  # manual policy
+            else:
+                buf[1 + i * 2] = d["level"]
+                buf[2 + i * 2] = d["policy"]
+        status = self.cooler_set(self.gpu, 0, buf)
+        if status != 0:
+            raise RuntimeError(f"SetCoolerLevels failed ({status})")
+
     def _get(self):
         buf = (ctypes.c_uint32 * NVAPI_BUFFER_U32)()
         buf[0] = NVAPI_VERSION
@@ -562,7 +617,7 @@ class NvApiControl:
     @staticmethod
     def _clock_entry(buf, state_off, domain):
         for j in range(8):
-            off = state_off + 2 + j * 10
+            off = state_off + 2 + j * 11
             if buf[off] == domain:
                 return off
         return None
@@ -629,6 +684,11 @@ class NvApiControl:
 
     def close(self):
         if self.dll and self.gpu:
+            if self.fan_default is not None:
+                try:
+                    self.set_fan(None)
+                except Exception:
+                    pass
             if self.power_raised:
                 try:
                     self.set_power(False)
@@ -665,9 +725,10 @@ class AfterburnerControl:
                 data = memory.read()
                 info = decode_macm(data)
                 if info["command"]:
-                    raise RuntimeError("Afterburner has a pending command; wait and try again")
+                    raise RuntimeError("GPU clock service has a pending command; wait and try again")
                 if info["flags"] & 0x40000:
-                    raise GpuSettingsChangedError("Custom voltage/frequency curve active; use Afterburner to reset or tune it")
+                    raise GpuSettingsChangedError(
+                        "A custom GPU voltage/frequency curve is active; reset GPU settings to stock first")
                 if expected is not None and [info[key][0] for key in ("core", "memory")] != list(expected):
                     raise GpuSettingsChangedError("Clock offsets changed in another app; refresh before applying")
                 header, _, _ = macm_layout(data)
@@ -693,9 +754,9 @@ class AfterburnerControl:
                 if result["command"] == 0:
                     actual = [int(round(result[key][0] * 1000)) for key in ("core", "memory")]
                     if actual != desired:
-                        raise RuntimeError("Afterburner readback differs from the request; check or reset in Afterburner")
+                        raise RuntimeError("GPU clock readback differs from the request; reset GPU offsets and try again")
                     return result
-            raise RuntimeError("Afterburner did not acknowledge the request; GPU state is unknown. Reset in Afterburner.")
+            raise RuntimeError("GPU clock service did not acknowledge the request; GPU state is unknown.")
 
 
 def oc_scale(temp):
@@ -822,14 +883,22 @@ class CoolingApp:
             pass
         self.root.geometry("860x860")
         self.root.minsize(780, 800)
+        self.nvapi = None
         try:
             backend = NvApiControl()
             backend.connect()
-            self.gpu_backend = backend
-            self.gpu_backend_name = backend.NAME
+            self.nvapi = backend
+            if backend.clock_ok:
+                self.gpu_backend = backend
+                self.gpu_backend_name = backend.NAME
+            else:
+                self.gpu_backend = AfterburnerControl()
+                self.gpu_backend_name = "MSI Afterburner"
         except Exception:
             self.gpu_backend = AfterburnerControl()
             self.gpu_backend_name = "MSI Afterburner"
+        self.ab_launch_attempted = False
+        self.ab_install_attempted = False
         self.gpu_data = {}
         self.gpu_control = {}
         self.gpu_results = queue.Queue()
@@ -870,6 +939,7 @@ class CoolingApp:
         self.running_procs = {}
         self.proc_last_scan = 0
         self.prev_power_scheme = None
+        self.gpu_fan_manual = False
         self.cpu_ratio_preset = CPU_OC_DEFAULT_RATIO
         self.cpu_ratio_from_config = False
         self.cpu_stock_ratio = 38
@@ -972,13 +1042,15 @@ class CoolingApp:
         self.computer.IsCpuEnabled = True
         self.computer.IsMotherboardEnabled = True
         self.computer.Open()
+        temps, loads = [], []
         for hw in self.computer.Hardware:
             if str(hw.HardwareType) == "Cpu":
                 for s in hw.Sensors:
-                    if s.Name == "CPU Package" and str(s.SensorType) == "Temperature":
-                        self.cpu_temp_sensor = s
-                    if s.Name == "CPU Total" and str(s.SensorType) == "Load":
-                        self.cpu_load_sensor = s
+                    st = str(s.SensorType)
+                    if st == "Temperature":
+                        temps.append(s)
+                    elif st == "Load":
+                        loads.append(s)
             for sub in getattr(hw, "SubHardware", []) or []:
                 for s in sub.Sensors:
                     st = str(s.SensorType)
@@ -986,8 +1058,20 @@ class CoolingApp:
                         self.controls[s.Index] = s
                     elif st == "Fan":
                         self.rpm_sensors[s.Index] = s
-        if self.cpu_temp_sensor is None:
-            raise RuntimeError("no CPU temperature sensor found")
+
+        def pick(sensors, preferred):
+            for name in preferred:
+                for s in sensors:
+                    if str(s.Name) == name:
+                        return s
+            for key in ("Package", "Tctl", "Tdie", "CCD", "Core"):
+                for s in sensors:
+                    if key.lower() in str(s.Name).lower():
+                        return s
+            return sensors[0] if sensors else None
+
+        self.cpu_temp_sensor = pick(temps, ("CPU Package",))
+        self.cpu_load_sensor = pick(loads, ("CPU Total", "Total"))
 
     def poll_loop(self):
         while not self.stop_flag.is_set():
@@ -1001,6 +1085,11 @@ class CoolingApp:
                                 if str(sensor.SensorType) == "Fan":
                                     self.rpm_sensors[sensor.Index] = sensor
                 temp = self.cpu_temp_sensor.Value if self.cpu_temp_sensor else None
+                if temp is None and self.cpu_connected:
+                    try:
+                        temp = self.cpu_backend.package_temp()
+                    except Exception:
+                        pass
                 load = self.cpu_load_sensor.Value if self.cpu_load_sensor else None
                 snap = {"cpu_temp": None if temp is None else float(temp),
                         "cpu_load": None if load is None else float(load),
@@ -1029,6 +1118,8 @@ class CoolingApp:
                     self.gpu_control = {"info": self.gpu_backend.read(), "updated_at": time.monotonic()}
                 except Exception as exc:
                     self.gpu_control = {"error": str(exc)}
+                    if isinstance(self.gpu_backend, AfterburnerControl):
+                        self.ensure_afterburner()
             if time.monotonic() - self.oc_last_event_check >= 35:
                 self.oc_last_event_check = time.monotonic()
                 try:
@@ -1194,7 +1285,7 @@ class CoolingApp:
             auto.pack(anchor="w", pady=(4, 8))
             switch.pack(anchor="w", pady=4)
             label = ttk.Label(card, text="CPU: connecting..." if key == "cpu"
-                              else "Locked - click 'Use tested Afterburner settings...' below to unlock",
+                              else "Locked - detecting GPU clock limits...",
                               wraplength=205)
             label.pack(anchor="w", pady=6)
             self.component_widgets[key] = {"auto": auto, "switch": switch, "status": label}
@@ -1210,8 +1301,9 @@ class CoolingApp:
         self.gpu_readback_label.pack(anchor="w", padx=12, pady=4)
         ttk.Label(gpu, textvariable=self.gpu_notice, wraplength=720).pack(anchor="w", padx=12, pady=4)
         ttk.Label(gpu, textvariable=self.gpu_auto_status, wraplength=720).pack(anchor="w", padx=12, pady=4)
-        ttk.Label(gpu, text="Auto is selected by default, but overclock switches start OFF. ON uses a user-tested preset,\n"
-            "not an unverified maximum. With Auto selected it waits for sustained GPU load, then scales the preset\n"
+        ttk.Label(gpu, text="Auto is selected by default and everything configures itself - no manual values needed.\n"
+            "PC Control creates a conservative clock preset automatically; the auto-tuner can raise it gradually.\n"
+            "With Auto selected it waits for sustained GPU load, then scales the preset\n"
             "by temperature: full below 149 F, tapering to zero near 176 F, off if hotter or idle.\n"
             "GPU memory means graphics-card memory, not system RAM. Both Auto controls use GPU load and core temperature.\n"
             "Temperature monitoring cannot guarantee stability. Thermal/fault resets remain active with Auto off.",
@@ -1249,6 +1341,36 @@ class CoolingApp:
             component["policy"] = AutoGpuPolicy()
         self.gpu_auto_status.set(reason)
 
+    def ensure_afterburner(self):
+        """Start the GPU clock-offset service; silently install the bundled
+        copy first when needed. Fully automatic - no user steps."""
+        if self.ab_launch_attempted:
+            return
+        for path in (os.path.expandvars(r"%ProgramFiles(x86)%\MSI Afterburner\MSIAfterburner.exe"),
+                     os.path.expandvars(r"%ProgramFiles%\MSI Afterburner\MSIAfterburner.exe")):
+            if os.path.exists(path):
+                self.ab_launch_attempted = True
+                try:
+                    subprocess.Popen([path], close_fds=True)
+                    self.gpu_notice.set("GPU clock service is starting; controls activate automatically")
+                except Exception:
+                    pass
+                return
+        if self.ab_install_attempted:
+            return
+        self.ab_install_attempted = True
+        installers = (glob.glob(os.path.join(APP_DIR, "afterburner*", "MSIAfterburnerSetup*.exe"))
+                      + glob.glob(os.path.join(APP_DIR, "MSIAfterburnerSetup*.exe")))
+        if not installers:
+            self.gpu_notice.set(
+                "GPU clock control unavailable: this GPU's driver does not allow direct clock writes")
+            return
+        try:
+            subprocess.Popen([installers[0], "/S"], close_fds=True)
+            self.gpu_notice.set("Installing GPU clock component; controls activate automatically")
+        except Exception:
+            pass
+
     def component_connection_ready(self):
         info = self.gpu_control.get("info")
         return bool(info and not info["command"] and
@@ -1271,7 +1393,7 @@ class CoolingApp:
         info = self.gpu_control.get("info")
         problem = None
         if (not valid_auto_preset(preset) or preset["uuid"] != self.gpu_data.get("uuid")) \
-                and isinstance(self.gpu_backend, NvApiControl) and self.gpu_data.get("uuid") and info:
+                and self.gpu_data.get("uuid") and info:
             preset = {"core": min(50.0, max(0.0, info["core"][2])),
                       "memory": min(100.0, max(0.0, info["memory"][2])),
                       "uuid": self.gpu_data["uuid"], "auto_default": True}
@@ -1279,13 +1401,13 @@ class CoolingApp:
                 self.gpu_auto_preset = preset
                 self.save_config()
         if not valid_auto_preset(preset) or preset["uuid"] != self.gpu_data.get("uuid"):
-            problem = "Maximum not calibrated. A user-tested GPU preset is required before enabling this switch."
+            problem = "Waiting for the automatic GPU clock preset."
         elif not self.component_connection_ready() or self.gpu_busy or self.gpu_reset_failed:
-            problem = "Wait for current Afterburner readback and resolve any reset failure first."
+            problem = "Wait for GPU clock readback and resolve any reset failure first."
         elif preset[key] <= info[key][3]:
             problem = "The saved preset has no overclock for this component."
         elif not info["is_default"] and not self.gpu_owned:
-            problem = "Existing external offsets detected. Review/reset them in Afterburner first."
+            problem = "Clock offsets from another app are active; press GPU OFF / Reset first."
         else:
             problem = gpu_apply_problem(self.snapshot, self.gpu_data, info, time.monotonic())
             if component["auto"].get() and problem and problem.startswith("Let the "):
@@ -1390,7 +1512,7 @@ class CoolingApp:
                     text="ON (Auto) - applies the cap under sustained CPU load, releases when idle")
         gpu = self.gpu_data
         info = self.gpu_control.get("info")
-        if (isinstance(self.gpu_backend, NvApiControl) and info and gpu.get("uuid")
+        if (info and gpu.get("uuid")
                 and self.component_connection_ready() and not self.gpu_reset_failed
                 and not self.gpu_busy):
             if not valid_auto_preset(self.gpu_auto_preset) \
@@ -1414,7 +1536,7 @@ class CoolingApp:
                     self.gpu_auto_enabled.set(True)
                     self.gpu_auto_status.set(
                         "Auto-enabled with a conservative built-in preset; applies under sustained GPU load")
-        if self.component_session or not isinstance(self.gpu_backend, NvApiControl):
+        if self.component_session:
             self.oc_auto_armed = True
 
     def tick_oc_tuner(self, now):
@@ -1632,7 +1754,7 @@ class CoolingApp:
         defaults = [info[key][3] for key in ("core", "memory")]
         if ((self.gpu_owned and self.gpu_managed_offsets is not None and actual != list(self.gpu_managed_offsets))
                 or (not self.gpu_owned and not info["is_default"])):
-            self.stop_components("External offsets changed; review Afterburner. No automatic reset sent.")
+            self.stop_components("External offsets changed; no automatic reset sent.")
             self.gpu_owned = False
             return
         cpu, temp, load = self.snapshot.get("cpu_temp"), self.gpu_data.get("temp"), self.gpu_data.get("load")
@@ -1683,16 +1805,16 @@ class CoolingApp:
             self.gpu_auto_status.set("Turn Auto OC off and wait for any pending operation before saving a preset")
             return
         if not info or now - self.gpu_control.get("updated_at", 0) > SENSOR_TIMEOUT:
-            self.gpu_auto_status.set("Fresh Afterburner readback required to save a preset")
+            self.gpu_auto_status.set("Fresh GPU readback required to save a preset")
             return
         # Saving only captures current offsets - no overclock is applied here,
         # so temperature limits do not apply. A pending command or active VF
         # curve can still make the readback unrepresentative, so keep those.
         if info.get("command"):
-            self.gpu_auto_status.set("Afterburner is processing another command")
+            self.gpu_auto_status.set("GPU clock service is processing another command")
             return
         if info.get("flags", 0) & 0x40000:
-            self.gpu_auto_status.set("Custom voltage/frequency curves must be managed in Afterburner")
+            self.gpu_auto_status.set("A custom GPU voltage/frequency curve is active; reset GPU settings to stock first")
             return
         staged = [info[key][0] for key in ("core", "memory")]
         preset = {"core": staged[0], "memory": staged[1], "uuid": self.gpu_data.get("uuid"), "user_tested": True}
@@ -1724,7 +1846,7 @@ class CoolingApp:
         elif self.gpu_busy or self.gpu_reset_failed or not info or not info["is_default"]:
             problem = "Reset clock offsets and wait for confirmed defaults before enabling Auto OC"
         elif time.monotonic() - self.gpu_control.get("updated_at", 0) > SENSOR_TIMEOUT:
-            problem = "Fresh Afterburner readback required before enabling Auto OC"
+            problem = "Fresh GPU readback required before enabling Auto OC"
         else:
             problem = gpu_apply_problem(self.snapshot, self.gpu_data, info, time.monotonic())
         if problem:
@@ -1763,7 +1885,7 @@ class CoolingApp:
                 or (not self.gpu_owned and not info["is_default"])):
             self.gpu_auto_enabled.set(False)
             self.gpu_owned = False
-            self.gpu_auto_status.set("Auto OC disabled: offsets were changed externally; review them in Afterburner")
+            self.gpu_auto_status.set("Auto OC disabled: clock offsets were changed by another app")
             return
         cpu = self.snapshot.get("cpu_temp")
         healthy = cpu is not None and math.isfinite(cpu) and 0 <= cpu < CRIT_TEMP
@@ -1803,7 +1925,7 @@ class CoolingApp:
             self.gpu_auto_status.set("Auto OC disabled: tested preset is missing or belongs to another GPU")
             return
         if self.gpu_reset_failed and not reset:
-            self.gpu_notice.set("Verify/reset offsets in Afterburner before requesting another overclock")
+            self.gpu_notice.set("Reset clock offsets before requesting another overclock")
             return
         info = self.gpu_control.get("info")
         reducing = False
@@ -1815,7 +1937,7 @@ class CoolingApp:
                 return
             reducing = all(value <= info[key][0] for key, value in zip(("core", "memory"), desired_offsets))
         if not reset:
-            problem = "Afterburner readback unavailable"
+            problem = "GPU clock readback unavailable"
             if info and time.monotonic() - self.gpu_control.get("updated_at", 0) <= SENSOR_TIMEOUT:
                 problem = None if reducing else gpu_apply_problem(self.snapshot, self.gpu_data, info, time.monotonic())
             if problem:
@@ -1868,7 +1990,7 @@ class CoolingApp:
             reset, result, error = self.gpu_results.get_nowait()
             self.gpu_busy = False
             if error:
-                self.stop_components("Overclock requests stopped after an operation failure; inspect Afterburner")
+                self.stop_components("Overclock requests stopped after an operation failure")
                 self.gpu_stop_after_busy = False
                 details = error if isinstance(error, dict) else {"message": error, "touched": True, "was_owned": True}
                 self.gpu_notice.set("GPU request failed: " + details["message"])
@@ -1876,7 +1998,7 @@ class CoolingApp:
                 if details.get("external"):
                     self.gpu_owned = False
                     self.gpu_reset_failed = False
-                    self.gpu_notice.set("External settings changed; no automatic reset sent. Review Afterburner.")
+                    self.gpu_notice.set("External clock settings changed; no automatic reset sent.")
                 elif reset:
                     self.gpu_owned = details["touched"] or details["was_owned"]
                     self.gpu_reset_failed = True
@@ -1893,7 +2015,7 @@ class CoolingApp:
                 self.gpu_owned = not result["is_default"]
                 self.gpu_managed_offsets = tuple(result[key][0] for key in ("core", "memory"))
                 self.gpu_notice.set("Default clock offsets confirmed." if result["is_default"] else
-                                    "Offsets acknowledged by Afterburner; stability has not been tested.")
+                                    "Offsets applied; stability has not been tested.")
                 if reset:
                     self.gpu_stop_after_busy = False
                     self.gpu_core_value.set(result["core"][3])
@@ -1933,7 +2055,7 @@ class CoolingApp:
             ready = usable and preset_ok and self.gpu_auto_preset[key] > info[key][3] and not self.gpu_reset_failed
             widgets["switch"].state(["!disabled"] if component["enabled"].get() or ready else ["disabled"])
             if not preset_ok:
-                text = "Locked - save a tested preset with 'Use tested Afterburner settings...' to unlock. Maximum not calibrated."
+                text = "Locked - waiting for the automatic GPU clock preset."
             elif not connected:
                 text = "Connection unavailable; actual speed unknown."
             else:
@@ -1943,11 +2065,11 @@ class CoolingApp:
             widgets["status"].config(text=text)
         if usable:
             self.gpu_switch_value.set(-1 if self.gpu_reset_failed else int(not info["is_default"]))
-            self.gpu_readback_label.config(text=f"Afterburner readback: core {info['core'][0]:+.0f} MHz, "
+            self.gpu_readback_label.config(text=f"GPU readback: core {info['core'][0]:+.0f} MHz, "
                 f"memory {info['memory'][0]:+.0f} MHz. " + ("Default offsets." if info["is_default"] else "Offsets active."))
         else:
             self.gpu_switch_value.set(-1)
-            self.gpu_readback_label.config(text=self.gpu_control.get("error", "Waiting for current Afterburner readback"))
+            self.gpu_readback_label.config(text=self.gpu_control.get("error", "Waiting for GPU clock readback"))
         if self.component_session:
             self.tick_components(now, connected)
         else:
@@ -2073,7 +2195,7 @@ class CoolingApp:
         try:
             self.refresh_performance()
         except Exception:
-            self.gpu_notice.set("GPU monitoring error - check Afterburner; cooling continues")
+            self.gpu_notice.set("GPU monitoring error; cooling continues")
             if self.gpu_owned and not self.gpu_busy and not self.gpu_reset_failed:
                 self.submit_gpu(reset=True, automatic=True)
         try:
@@ -2090,6 +2212,10 @@ class CoolingApp:
             pass
         try:
             self.tick_game(time.monotonic())
+        except Exception:
+            pass
+        try:
+            self.tick_gpu_fan()
         except Exception:
             pass
         try:
@@ -2200,7 +2326,36 @@ class CoolingApp:
                 text="watching for a listed game..." if enabled
                 else "off - boosts the listed game while it runs")
 
+    def tick_gpu_fan(self):
+        """Pin the GPU fan to 100% when hot; hand it back to auto when cool."""
+        backend = self.nvapi
+        if not backend or not backend.gpu:
+            return
+        applied = bool(self.gpu_managed_offsets and any(self.gpu_managed_offsets))
+        if applied != backend.power_raised:
+            try:
+                backend.set_power(applied)
+            except Exception:
+                pass
+        temp = self.gpu_data.get("temp")
+        if not isinstance(temp, (int, float)):
+            return
+        if not self.gpu_fan_manual and temp >= 76:
+            backend.set_fan(100)
+            self.gpu_fan_manual = True
+        elif self.gpu_fan_manual and temp <= 70:
+            backend.set_fan(None)
+            self.gpu_fan_manual = False
+
     def on_close(self):
+        if self.gpu_fan_manual and self.nvapi:
+            try:
+                self.nvapi.set_fan(None)
+            except Exception:
+                pass
+            self.gpu_fan_manual = False
+        if self.nvapi:
+            self.nvapi.close()
         self.game_booster.release()
         self._restore_power_scheme()
         self.stop_components("Closing: overclock requests off")

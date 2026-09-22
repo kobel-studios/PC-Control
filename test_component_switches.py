@@ -110,8 +110,9 @@ class StartupStateTests(unittest.TestCase):
         self.assertFalse(self.app.component_session)
 
 
-class MissingPresetBlocksEnable(unittest.TestCase):
-    """Enabling a switch without a saved preset is blocked."""
+class AutoPresetCreation(unittest.TestCase):
+    """Missing/mismatched presets are replaced by a conservative auto preset -
+    enabling a switch never requires the user to enter values."""
 
     def setUp(self):
         self.app, self.root, self.info = make_app()
@@ -119,29 +120,38 @@ class MissingPresetBlocksEnable(unittest.TestCase):
     def tearDown(self):
         teardown(self.app, self.root)
 
-    def test_enable_without_preset_blocked(self):
+    def _assert_auto_preset(self):
+        preset = self.app.gpu_auto_preset
+        self.assertTrue(gui.valid_auto_preset(preset))
+        self.assertTrue(preset.get("auto_default"))
+        self.assertEqual(preset["uuid"], "GPU-test")
+        self.assertGreater(preset["core"], 0)
+        self.assertGreater(preset["memory"], 0)
+
+    def test_enable_without_preset_autocreates(self):
         for key in ("core", "memory"):
+            self.app.gpu_auto_preset = None
             self.app.gpu_components[key]["enabled"].set(True)
-            with patch("tkinter.messagebox.askyesno") as confirm:
+            with patch("tkinter.messagebox.askyesno", return_value=False):
                 self.app.on_component_toggle(key)
-            confirm.assert_not_called()
+            self._assert_auto_preset()
             self.assertFalse(self.app.gpu_components[key]["enabled"].get())
 
-    def test_enable_with_wrong_uuid_preset_blocked(self):
+    def test_enable_with_wrong_uuid_preset_autocreates(self):
         self.app.gpu_auto_preset = {"core": 25, "memory": 50, "uuid": "GPU-other", "user_tested": True}
         for key in ("core", "memory"):
             self.app.gpu_components[key]["enabled"].set(True)
-            with patch("tkinter.messagebox.askyesno") as confirm:
+            with patch("tkinter.messagebox.askyesno", return_value=False):
                 self.app.on_component_toggle(key)
-            confirm.assert_not_called()
+            self._assert_auto_preset()
             self.assertFalse(self.app.gpu_components[key]["enabled"].get())
 
-    def test_enable_with_default_preset_blocked(self):
+    def test_enable_with_default_preset_autocreates(self):
         self.app.gpu_auto_preset = {"core": 0, "memory": 0, "uuid": "GPU-test", "user_tested": True}
         self.app.gpu_components["core"]["enabled"].set(True)
-        with patch("tkinter.messagebox.askyesno") as confirm:
+        with patch("tkinter.messagebox.askyesno", return_value=False):
             self.app.on_component_toggle("core")
-        confirm.assert_not_called()
+        self._assert_auto_preset()
         self.assertFalse(self.app.gpu_components["core"]["enabled"].get())
 
 
