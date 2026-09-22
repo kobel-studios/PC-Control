@@ -155,7 +155,7 @@ class WidgetTests(unittest.TestCase):
             self.assertEqual(app.auto_boost, [50, 50])
             self.assertEqual(app.temp_label.cget("text"), "122 F")
             self.assertIn("Load-aware", app.status_label.cget("text"))
-            self.assertEqual(root.title(), "PC Control")
+            self.assertEqual(root.title(), "Gaming FPS Control")
             self.assertFalse(hasattr(app, "notebook"))
             self.assertTrue(app.cpu_oc_switch.instate(["disabled"]))
             self.assertTrue(app.cpu_auto_value.get())

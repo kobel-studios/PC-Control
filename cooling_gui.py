@@ -99,7 +99,7 @@ def gpu_apply_problem(cpu, gpu, info, now):
     if info.get("command"):
         return "GPU clock service is processing another command"
     if info.get("flags", 0) & 0x40000:
-        return ("A custom GPU voltage/frequency curve is active; PC Control never "
+        return ("A custom GPU voltage/frequency curve is active; FPS Control never "
                 "changes voltage - reset GPU settings to stock first")
     return None
 
@@ -221,7 +221,7 @@ class MacmMemory:
             raise RuntimeError("GPU clock service is busy")
         try:
             if result == 0x80:
-                raise RuntimeError("GPU clock service mutex was abandoned; restart PC Control")
+                raise RuntimeError("GPU clock service mutex was abandoned; restart FPS Control")
             yield
         finally:
             self.api.ReleaseMutex(self.mutex)
@@ -320,7 +320,7 @@ class CpuOcBackend:
         except OSError as exc:
             raise RuntimeError(f"pawnio_open: {exc} (is the PawnIO driver service running?)")
         if hr != 0 or not handle.value:
-            raise RuntimeError(f"pawnio_open failed (HRESULT 0x{hr & 0xFFFFFFFF:08X}); run PC Control as administrator")
+            raise RuntimeError(f"pawnio_open failed (HRESULT 0x{hr & 0xFFFFFFFF:08X}); run FPS Control as administrator")
         self.handle = handle
         blob = None
         last_err = None
@@ -817,7 +817,7 @@ class AfterburnerControl:
                     if target is None or not math.isfinite(target) or not lower <= target <= upper:
                         raise ValueError("Clock offset is outside the GPU's supported range")
                     if not reset and not default <= target <= min(upper, default + cap):
-                        raise ValueError("Clock offset exceeds PC Control's limited adjustment range")
+                        raise ValueError("Clock offset exceeds FPS Control's limited adjustment range")
                     desired.append(int(round(target * 1000)))
                 progress[0] = True
                 memory.write_int(header + CORE_OFFSET, desired[0])
@@ -896,6 +896,37 @@ HIGH_PRIORITY_CLASS = 0x00000080
 NORMAL_PRIORITY_CLASS = 0x00000020
 PROCESS_SET_INFORMATION = 0x0200
 HIGH_PERF_SCHEME = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+
+# FPS cleanup: processes that must never be touched, and known non-essential
+# hogs that can be closed without asking (restartable, no unsaved work).
+CLEANUP_PROTECTED = frozenset((
+    "system", "registry", "smss", "csrss", "wininit", "winlogon", "services",
+    "lsass", "svchost", "dwm", "fontdrvhost", "memory compression",
+    "secure system", "system idle process", "idle", "consent", "sihost",
+    "ctfmon", "taskmgr", "msmpeng", "securityhealthservice", "gamemon",
+    "gamemon.des", "easyanticheat", "beservice", "vgtray", "vgc",
+    # Windows shell / security: closing these breaks the desktop or AV.
+    "explorer", "shellexperiencehost", "startmenuexperiencehost", "searchhost",
+    "searchui", "runtimebroker", "applicationframehost", "dllhost", "conhost",
+    "audiodg", "wudfhost", "dashost", "spoolsv",
+    # Cooling/telemetry + GPU driver helpers this app depends on.
+    "librehardwaremonitor", "openhardwaremonitor", "nvcontainer",
+    "nvdisplay.container", "nvidia share", "nvidia web helper",
+    "msiafterburner", "afterburnerhelper", "rtss", "rtsshooksloader",
+    "rtsshooksloader64", "rtsscl",
+    # Ambiguous hosts: this app, the code verifier and other tools run under
+    # python/pythonw names - never auto-close something we cannot identify.
+    "python", "pythonw",
+))
+CLEANUP_SAFE_CLOSE = frozenset((
+    "spotify", "discord", "discordupdate", "discordptb", "discordcanary",
+    "opera", "operagx", "chrome", "msedge", "firefox", "brave", "vivaldi",
+    "robloxplayerbeta", "epicgameslauncher", "steamwebhelper", "steamservice",
+    "onedrive", "dropbox", "overwolf", "overwolfbrowser", "updater",
+    "crashpad", "qtaudio", "obs-browser-page", "msedgewebview2",
+))
+CLEANUP_CPU_MIN = 25.0  # PercentProcessorTime above this = worth closing
+CLEANUP_RECLOSE_AFTER = 120.0  # respawned apps can be closed again after this
 TIMER_RES_100NS = 5000  # 0.5 ms
 
 
@@ -953,7 +984,7 @@ class GameBooster:
 class CoolingApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PC Control")
+        self.root.title("Gaming FPS Control")
         try:
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
             self.root.iconphoto(True, tk.PhotoImage(file=icon_path))
@@ -1014,6 +1045,16 @@ class CoolingApp:
         self.game_exes_var = tk.StringVar(value="helldivers2.exe")
         self.game_booster = GameBooster()
         self.boosting_games = set()
+        self.fps_cleanup_value = tk.BooleanVar(value=False)
+        self.fps_cleanup_active = False
+        self.cleanup_last_scan = 0.0
+        self.cleanup_candidates = []
+        self.cleanup_asked = set()
+        self.cleanup_queue = []
+        self.cleanup_dialog = None
+        self.cleanup_closed = {}
+        self.cleanup_always = set()
+        self.cleanup_never = set()
         self.running_procs = {}
         self.proc_last_scan = 0
         self.prev_power_scheme = None
@@ -1077,6 +1118,12 @@ class CoolingApp:
                 self.cpu_ratio_preset = ratio
                 self.cpu_ratio_from_config = True
             self.game_boost_value.set(bool(cfg.get("game_boost", False)))
+            self.fps_cleanup_value.set(bool(cfg.get("fps_cleanup", False)))
+            for key, target in (("cleanup_always", self.cleanup_always),
+                                ("cleanup_never", self.cleanup_never)):
+                names = cfg.get(key)
+                if isinstance(names, str):
+                    target.update(n.strip().lower() for n in names.split(",") if n.strip())
             exes = cfg.get("game_exes")
             if isinstance(exes, str) and exes.strip():
                 self.game_exes_var.set(exes)
@@ -1105,6 +1152,9 @@ class CoolingApp:
                            "gpu_auto_preset": self.gpu_auto_preset,
                            "cpu_ratio_preset": self.cpu_ratio_preset,
                            "game_boost": self.game_boost_value.get(),
+                           "fps_cleanup": self.fps_cleanup_value.get(),
+                           "cleanup_always": ",".join(sorted(self.cleanup_always)),
+                           "cleanup_never": ",".join(sorted(self.cleanup_never)),
                            "game_exes": self.game_exes_var.get()}, f)
         except Exception:
             pass
@@ -1225,6 +1275,27 @@ class CoolingApp:
                     self.running_procs = procs
                 except Exception:
                     pass
+            if self.fps_cleanup_active and time.monotonic() - self.cleanup_last_scan >= 12:
+                self.cleanup_last_scan = time.monotonic()
+                try:
+                    out = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | "
+                         "Where-Object {$_.PercentProcessorTime -gt 10} | "
+                         "Select-Object Name,IDProcess,PercentProcessorTime | ConvertTo-Csv -NoTypeInformation"],
+                        capture_output=True, text=True, timeout=15,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                    rows = []
+                    for row in csv.DictReader(io.StringIO(out)):
+                        try:
+                            rows.append((row["Name"].strip().lower(),
+                                         int(row["IDProcess"]),
+                                         float(row["PercentProcessorTime"])))
+                        except (KeyError, ValueError):
+                            pass
+                    self.cleanup_candidates = rows
+                except Exception:
+                    pass
             self.stop_flag.wait(1)
 
     def set_duty(self, channel, value):
@@ -1341,7 +1412,7 @@ class CoolingApp:
         columns.pack(fill="x", padx=8, pady=8)
         self.gpu_sliders = []
         self.component_widgets = {}
-        for index, (key, title) in enumerate((("core", "GPU core"), ("memory", "GPU memory (VRAM)"), ("cpu", "CPU"))):
+        for index, (key, title) in enumerate((("core", "GPU core"), ("cpu", "CPU"))):
             columns.columnconfigure(index, weight=1, uniform="component")
             card = ttk.Frame(columns)
             card.grid(row=0, column=index, sticky="nsew", padx=8)
@@ -1355,9 +1426,9 @@ class CoolingApp:
                 self.cpu_auto_switch = auto
             else:
                 component = self.gpu_components[key]
-                auto = ToggleSwitch(card, text="Auto " + ("GPU core" if key == "core" else "GPU memory"),
+                auto = ToggleSwitch(card, text="Auto GPU core",
                     variable=component["auto"], command=lambda part=key: self.on_component_auto_change(part))
-                switch = ToggleSwitch(card, text=("GPU core OC" if key == "core" else "GPU memory OC"),
+                switch = ToggleSwitch(card, text="GPU core OC",
                     variable=component["enabled"],
                     command=lambda part=key: self.on_component_toggle(part), state="disabled")
             auto.pack(anchor="w", pady=(4, 8))
@@ -1380,10 +1451,9 @@ class CoolingApp:
         ttk.Label(gpu, textvariable=self.gpu_notice, wraplength=720).pack(anchor="w", padx=12, pady=4)
         ttk.Label(gpu, textvariable=self.gpu_auto_status, wraplength=720).pack(anchor="w", padx=12, pady=4)
         ttk.Label(gpu, text="Auto is selected by default and everything configures itself - no manual values needed.\n"
-            "PC Control creates a conservative clock preset automatically; the auto-tuner can raise it gradually.\n"
+            "FPS Control creates a conservative clock preset automatically; the auto-tuner can raise it gradually.\n"
             "With Auto selected it waits for sustained GPU load, then scales the preset\n"
             "by temperature: full below 149 F, tapering to zero near 176 F, off if hotter or idle.\n"
-            "GPU memory means graphics-card memory, not system RAM. Both Auto controls use GPU load and core temperature.\n"
             "Temperature monitoring cannot guarantee stability. Thermal/fault resets remain active with Auto off.",
             wraplength=720).pack(anchor="w", padx=12, pady=8)
         self.gpu_save_preset_button.state(["disabled"])
@@ -1408,6 +1478,17 @@ class CoolingApp:
         ttk.Label(game, text="While a listed game runs: sets it to High CPU priority, speeds up the Windows\n"
             "timer, and keeps the High Performance power plan active. Helps frame pacing; expect small gains.\n"
             "Anti-cheat games (e.g. Helldivers 2) may block the priority change - the timer boost still applies.",
+            wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
+        crow = ttk.Frame(game)
+        crow.pack(fill="x", padx=8, pady=6)
+        ToggleSwitch(crow, text="FPS cleanup", variable=self.fps_cleanup_value,
+                     command=self.on_fps_cleanup_toggle).pack(side="left")
+        ttk.Button(crow, text="Reset choices", command=self.reset_cleanup_choices).pack(side="right")
+        self.fps_cleanup_status = ttk.Label(game, text="off - frees CPU for the listed game",
+                                            wraplength=720)
+        self.fps_cleanup_status.pack(anchor="w", padx=12, pady=(0, 4))
+        ttk.Label(game, text="While a listed game runs: closes known background hogs automatically, and asks\n"
+            "before closing anything that might be important. 'Always close' and 'never' answers are remembered.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
 
     def stop_components(self, reason):
@@ -1569,7 +1650,7 @@ class CoolingApp:
         if not os.path.exists(installer):
             messagebox.showerror("Installer missing",
                 f"PawnIO_setup.exe not found in {APP_DIR}.\n"
-                "Download PawnIO from https://pawnio.eu and install it, then restart PC Control.",
+                "Download PawnIO from https://pawnio.eu and install it, then restart FPS Control.",
                 parent=self.root)
             return
         if messagebox.askyesno("Install PawnIO driver?",
@@ -1849,7 +1930,10 @@ class CoolingApp:
         scale = oc_scale(temp)
         desired = list(actual)
         for index, key in enumerate(("core", "memory")):
-            component = self.gpu_components[key]
+            component = self.gpu_components.get(key)
+            if component is None:
+                desired[index] = defaults[index]
+                continue
             if not component["enabled"].get() or hot:
                 component["applied"] = False
                 desired[index] = defaults[index]
@@ -1904,7 +1988,7 @@ class CoolingApp:
         if not messagebox.askyesno("Save your tested GPU preset?",
             f"Have you manually tested core {staged[0]:+.0f} MHz / memory {staged[1]:+.0f} MHz\n"
             "independently AND together under sustained load without crashes or visual glitches?\n\n"
-            "PC Control has NOT tested stability. Save only if you have tested these exact settings.", parent=self.root):
+            "FPS Control has NOT tested stability. Save only if you have tested these exact settings.", parent=self.root):
             return
         self.gpu_auto_preset = preset
         self.save_config()
@@ -2024,7 +2108,7 @@ class CoolingApp:
                 self.gpu_notice.set(problem)
                 return
             if not info["is_default"] and not self.gpu_owned:
-                self.gpu_notice.set("Existing offsets detected. Reset them before PC Control takes ownership.")
+                self.gpu_notice.set("Existing offsets detected. Reset them before FPS Control takes ownership.")
                 return
             if desired_offsets is not None:
                 core, memory = desired_offsets
@@ -2131,7 +2215,9 @@ class CoolingApp:
         self.gpu_reset_button.state(["!disabled"] if usable else ["disabled"])
         preset_ok = valid_auto_preset(self.gpu_auto_preset) and self.gpu_auto_preset["uuid"] == gpu.get("uuid")
         for key, component in self.gpu_components.items():
-            widgets = self.component_widgets[key]
+            widgets = self.component_widgets.get(key)
+            if not widgets:
+                continue
             ready = usable and preset_ok and self.gpu_auto_preset[key] > info[key][3] and not self.gpu_reset_failed
             widgets["switch"].state(["!disabled"] if component["enabled"].get() or ready else ["disabled"])
             if not preset_ok:
@@ -2292,6 +2378,7 @@ class CoolingApp:
             pass
         try:
             self.tick_game(time.monotonic())
+            self.tick_cleanup(time.monotonic())
         except Exception:
             pass
         try:
@@ -2406,6 +2493,112 @@ class CoolingApp:
                 text="watching for a listed game..." if enabled
                 else "off - boosts the listed game while it runs")
 
+    def on_fps_cleanup_toggle(self):
+        self.save_config()
+        if not self.fps_cleanup_value.get():
+            self.fps_cleanup_active = False
+            self.fps_cleanup_status.config(text="off - frees CPU for the listed game")
+        else:
+            self.fps_cleanup_status.config(text="watching for a listed game...")
+
+    def reset_cleanup_choices(self):
+        self.cleanup_always.clear()
+        self.cleanup_never.clear()
+        self.cleanup_asked.clear()
+        self.save_config()
+        self.fps_cleanup_status.config(text="remembered close/never choices cleared")
+
+    def _cleanup_game_names(self):
+        return {n.strip().lower().removesuffix(".exe")
+                for n in self.game_exes_var.get().split(",") if n.strip()}
+
+    def tick_cleanup(self, now):
+        enabled = self.fps_cleanup_value.get()
+        gaming = bool(self.boosting_games)
+        self.fps_cleanup_active = bool(enabled and gaming)
+        if not enabled:
+            self.fps_cleanup_status.config(text="off - frees CPU for the listed game")
+            return
+        if not gaming:
+            self.fps_cleanup_status.config(text="watching for a listed game...")
+            return
+        protected = CLEANUP_PROTECTED | self.cleanup_never | self._cleanup_game_names()
+        closed = 0
+        for name, pid, cpu in list(self.cleanup_candidates):
+            if pid == os.getpid() or cpu < CLEANUP_CPU_MIN or name in protected:
+                continue
+            if name in self.cleanup_closed and now - self.cleanup_closed[name] < CLEANUP_RECLOSE_AFTER:
+                continue
+            if name in CLEANUP_SAFE_CLOSE or name in self.cleanup_always:
+                self._cleanup_close(pid, name)
+                closed += 1
+            elif name not in self.cleanup_asked:
+                self.cleanup_asked.add(name)
+                self.cleanup_queue.append((name, pid, cpu))
+        self._cleanup_next_ask()
+        if closed:
+            self.fps_cleanup_status.config(text=f"closed {closed} background hog(s) to free CPU")
+
+    def _cleanup_close(self, pid, name):
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T"],
+                           capture_output=True, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.cleanup_closed[name] = time.monotonic()
+            self.root.after(4000, lambda p=pid: self._cleanup_force(p))
+        except Exception:
+            pass
+
+    def _cleanup_force(self, pid):
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                 capture_output=True, text=True, timeout=10,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            if str(pid) in out:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                               capture_output=True, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+
+    def _cleanup_next_ask(self):
+        if self.cleanup_dialog is not None or not self.cleanup_queue:
+            return
+        name, pid, cpu = self.cleanup_queue.pop(0)
+        dlg = tk.Toplevel(self.root)
+        self.cleanup_dialog = dlg
+        dlg.title("FPS cleanup")
+        dlg.transient(self.root)
+        dlg.attributes("-topmost", True)
+        dlg.configure(bg="#1e1f24")
+        ttk.Label(dlg, text=f'"{name}" is using about {cpu:.0f}% CPU while your game is running.\n'
+                            "Close it to free resources?",
+                  wraplength=360).pack(padx=16, pady=(14, 8))
+        row = ttk.Frame(dlg)
+        row.pack(pady=(0, 14))
+
+        def choose(choice):
+            self.cleanup_dialog = None
+            dlg.destroy()
+            self._cleanup_choose(name, pid, choice)
+
+        for text, choice in (("Close once", "close"), ("Always close", "always"),
+                             ("Leave it", "skip"), ("Never ask", "never")):
+            ttk.Button(row, text=text, command=lambda c=choice: choose(c)).pack(side="left", padx=4)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose("skip"))
+
+    def _cleanup_choose(self, name, pid, choice):
+        if choice in ("close", "always"):
+            if choice == "always":
+                self.cleanup_always.add(name)
+                self.save_config()
+            self._cleanup_close(pid, name)
+            self.fps_cleanup_status.config(text=f"closed {name} to free CPU")
+        elif choice == "never":
+            self.cleanup_never.add(name)
+            self.save_config()
+        self._cleanup_next_ask()
+
     def tick_gpu_fan(self):
         """Pin the GPU fan to 100% when hot; hand it back to auto when cool."""
         backend = self.nvapi
@@ -2468,8 +2661,8 @@ def close_previous_controller(user, title="Cooling Control"):
         return
     answer = user.MessageBoxW(None,
         f"An older {title} window is still running.\n\n"
-        "Close it normally and open PC Control? The old app will be asked to restore motherboard control.\n"
-        "If it does not close, the new app will not take over.", "PC Control - update", 0x124)
+        "Close it normally and open FPS Control? The old app will be asked to restore motherboard control.\n"
+        "If it does not close, the new app will not take over.", "FPS Control - update", 0x124)
     if answer != 6:
         raise RuntimeError("Update canceled; the existing cooling controller was left running")
     if not user.PostMessageW(window, 0x0010, 0, 0):
@@ -2500,6 +2693,8 @@ def single_instance():
     user.IsWindow.restype = wt.BOOL
     close_previous_controller(user)
     if "--restart" in sys.argv:
+        close_previous_controller(user, "Gaming FPS Control")
+        close_previous_controller(user, "FPS Control")
         close_previous_controller(user, "PC Control")
     handle = kernel.CreateMutexW(None, False, "Local\\HQ-PC-Control")
     error = ctypes.get_last_error()
@@ -2507,7 +2702,7 @@ def single_instance():
         raise ctypes.WinError(error)
     try:
         if error == 183:
-            raise RuntimeError("PC Control is already running. Use its existing window.")
+            raise RuntimeError("FPS Control is already running. Use its existing window.")
         yield
     finally:
         kernel.CloseHandle(handle)
@@ -2530,7 +2725,7 @@ def main():
     except Exception as exc:
         with open(os.path.join(APP_DIR, "gui_error.txt"), "w", encoding="utf-8") as f:
             f.write(traceback.format_exc())
-        messagebox.showerror("PC Control", str(exc), parent=root)
+        messagebox.showerror("FPS Control", str(exc), parent=root)
         if root is not None:
             root.destroy()
 
