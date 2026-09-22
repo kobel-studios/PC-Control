@@ -528,17 +528,27 @@ class NvApiControl:
         self.cooler_get = self._fn(0xDA141340, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p)
         self.cooler_set = self._fn(0x891FA0AE, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p)
         self.fan_default = None
-        self.clock_ok = False
+        # Pascal-era clock control: shifting the VF/boost table is how driver-level
+        # core offsets are applied when SetPstates20 is not supported.
+        self.mask_get = self._fn(0x507B4B59, ctypes.c_void_p, ctypes.c_void_p)
+        self.table_get = self._fn(0x23F1B133, ctypes.c_void_p, ctypes.c_void_p)
+        self.table_set = self._fn(0x0733E009, ctypes.c_void_p, ctypes.c_void_p)
+        self.boost_ok = False
+        self.pstates_write_ok = False
+        self._pstate_ranges = {}
         try:
-            self.read()
-            # Probe write support with a no-op write of the unchanged buffer.
-            # Some drivers accept reads but reject clock writes entirely
-            # (NVAPI_NOT_SUPPORTED); those must fall back instead of failing
-            # mid-apply.
-            buf = self._get()
-            self.clock_ok = self.set_pstates(self.gpu, buf) == 0
+            m, t = self._boost_state()
+            self.boost_ok = bool(self._enabled_entries(m)) and \
+                self.table_set(self.gpu, t) == 0  # no-op write probe
         except Exception:
             pass
+        try:
+            buf = self._get()
+            self._pstate_ranges = self._deltas(buf)
+            self.pstates_write_ok = self.set_pstates(self.gpu, buf) == 0
+        except Exception:
+            pass
+        self.clock_ok = self.boost_ok or self.pstates_write_ok
 
     def _power_info(self):
         buf = (ctypes.c_uint32 * 46)()
@@ -633,37 +643,79 @@ class NvApiControl:
                 out[domain] = tuple(to_i32(buf[off + k]) for k in (3, 4, 5))
         return out
 
+    # NV_GPU_CLOCK_MASKS: version(4) + mask[32] + unk[32] + clocks[255] * 24 bytes
+    # NV_GPU_CLOCK_TABLE: version(4) + mask[32] + unk[32] + clocks[255] * 36 bytes
+    #   table entry: clockType(4) + unk[16] + frequencyDeltaKHz(4, stored x2) + unk[12]
+    NVAPI_MASKS_BYTES = 4 + 32 + 32 + 255 * 24
+    NVAPI_TABLE_BYTES = 4 + 32 + 32 + 255 * 36
+
+    def _boost_state(self):
+        m = (ctypes.c_uint8 * self.NVAPI_MASKS_BYTES)()
+        m[0:4] = (self.NVAPI_MASKS_BYTES | (1 << 16)).to_bytes(4, "little")
+        if self.mask_get(self.gpu, m) != 0:
+            raise RuntimeError("GetClockBoostMask failed")
+        t = (ctypes.c_uint8 * self.NVAPI_TABLE_BYTES)()
+        t[0:4] = (self.NVAPI_TABLE_BYTES | (1 << 16)).to_bytes(4, "little")
+        t[4:36] = m[4:36]
+        if self.table_get(self.gpu, t) != 0:
+            raise RuntimeError("GetClockBoostTable failed")
+        return m, t
+
+    @staticmethod
+    def _enabled_entries(mask_buf):
+        """Enabled core-clock (clockType 0) table indices."""
+        return [i for i in range(255)
+                if mask_buf[68 + i * 24 + 4] == 1
+                and int.from_bytes(mask_buf[68 + i * 24: 68 + i * 24 + 4], "little") == 0]
+
+    @staticmethod
+    def _boost_deltas(mask_buf, table_buf):
+        """Raw frequencyDeltaKHz values (stored x2) for enabled entries."""
+        return {i: int.from_bytes(table_buf[68 + i * 36 + 20: 68 + i * 36 + 24],
+                                  "little", signed=True)
+                for i in NvApiControl._enabled_entries(mask_buf)}
+
+    def _boost_write(self, core_mhz):
+        """Uniform VF-curve shift. Delta field stores kHz * 2."""
+        m, t = self._boost_state()
+        raw = int(round(core_mhz * 2000))
+        for i in self._enabled_entries(m):
+            off = 68 + i * 36 + 20
+            t[off:off + 4] = raw.to_bytes(4, "little", signed=True)
+        status = self.table_set(self.gpu, t)
+        if status != 0:
+            raise RuntimeError(f"SetClockBoostTable failed (status {status})")
+
+    def _core_offset_mhz(self):
+        """Current uniform core offset in MHz; non-uniform curves report max
+        and set the 0x40000 'custom curve' flag in read()."""
+        m, t = self._boost_state()
+        deltas = self._boost_deltas(m, t)
+        return deltas, max(deltas.values(), default=0) / 2000.0
+
     def read(self):
-        deltas = self._deltas(self._get())
-        if NV_CLOCK_GRAPHICS not in deltas:
-            raise RuntimeError("GPU clock deltas not exposed by the driver")
         result = {"flags": 0, "command": 0}
-        for domain, key in ((NV_CLOCK_GRAPHICS, "core"), (NV_CLOCK_MEMORY, "memory")):
-            value, lo, hi = deltas.get(domain, (0, 0, 0))
-            result[key] = [value / 1000.0, lo / 1000.0, hi / 1000.0, 0.0]
-        result["is_default"] = deltas.get(NV_CLOCK_GRAPHICS, (0,))[0] == 0 and \
-                               deltas.get(NV_CLOCK_MEMORY, (0,))[0] == 0
+        core_cur = 0.0
+        if self.boost_ok:
+            deltas, core_cur = self._core_offset_mhz()
+            if len(set(deltas.values())) > 1:
+                result["flags"] |= 0x40000  # non-uniform custom curve
+        elif NV_CLOCK_GRAPHICS in self._pstate_ranges:
+            core_cur = self._pstate_ranges[NV_CLOCK_GRAPHICS][0] / 1000.0
+        else:
+            raise RuntimeError("GPU clock deltas not exposed by the driver")
+        lo, hi = (self._pstate_ranges.get(NV_CLOCK_GRAPHICS, (0, -200000, 500000))[1:3])
+        result["core"] = [core_cur, lo / 1000.0, min(hi, 500000) / 1000.0, 0.0]
+        mem = self._pstate_ranges.get(NV_CLOCK_MEMORY, (0, 0, 0))
+        mem_hi = mem[2] / 1000.0 if self.pstates_write_ok else 0.0
+        result["memory"] = [mem[0] / 1000.0, mem[1] / 1000.0, mem_hi, 0.0]
+        result["is_default"] = core_cur == 0 and mem[0] == 0
         return result
 
-    def apply(self, core_mhz=None, memory_mhz=None, reset=False, expected=None):
+    def _pstates_apply(self, core_khz, mem_khz):
+        """Write both deltas through SetPstates20 (drivers that support it)."""
         buf = self._get()
-        deltas = self._deltas(buf)
-        current = [deltas.get(d, (0,))[0] / 1000.0 for d in (NV_CLOCK_GRAPHICS, NV_CLOCK_MEMORY)]
-        if expected is not None and current != list(expected):
-            raise GpuSettingsChangedError("Clock offsets changed elsewhere; refresh before applying")
-        desired = []
-        for key, value, cap, domain in (("core", core_mhz, 100, NV_CLOCK_GRAPHICS),
-                                        ("memory", memory_mhz, 250, NV_CLOCK_MEMORY)):
-            _, lo, hi = deltas.get(domain, (0, 0, 0))
-            target = 0.0 if reset else value
-            if target is None or not math.isfinite(target):
-                raise ValueError("Clock offset is outside the GPU's supported range")
-            if hi > 0 and target > hi:
-                raise ValueError("Clock offset exceeds the driver's supported range")
-            if not reset and not 0 <= target <= cap:
-                raise ValueError("Clock offset exceeds PC Control's limited adjustment range")
-            desired.append(int(round(target * 1000)))
-        for domain, khz in ((NV_CLOCK_GRAPHICS, desired[0]), (NV_CLOCK_MEMORY, desired[1])):
+        for domain, khz in ((NV_CLOCK_GRAPHICS, core_khz), (NV_CLOCK_MEMORY, mem_khz)):
             off = self._clock_entry(buf, 5, domain)
             if off is None:
                 raise RuntimeError(f"Clock domain {domain} not editable on this GPU")
@@ -671,16 +723,42 @@ class NvApiControl:
         status = self.set_pstates(self.gpu, buf)
         if status != 0:
             raise RuntimeError(f"SetPstates20 failed (status {status}); GPU state may be unchanged")
+
+    def apply(self, core_mhz=None, memory_mhz=None, reset=False, expected=None):
+        cur = self.read()
+        if expected is not None and [cur["core"][0], cur["memory"][0]] != list(expected):
+            raise GpuSettingsChangedError("Clock offsets changed elsewhere; refresh before applying")
+        if cur["flags"] & 0x40000 and not reset:
+            raise GpuSettingsChangedError(
+                "A custom GPU voltage/frequency curve is active; reset GPU settings to stock first")
+        core_t = 0.0 if reset else (core_mhz or 0.0)
+        mem_t = 0.0 if reset else (memory_mhz or 0.0)
+        if not reset:
+            if not 0 <= core_t <= min(100, max(0.0, cur["core"][2])):
+                raise ValueError("Core offset is outside the supported range")
+            if not 0 <= mem_t <= min(250, max(0.0, cur["memory"][2])):
+                raise ValueError("Memory offset is outside the supported range")
+        if core_t != cur["core"][0] and not (self.boost_ok or self.pstates_write_ok):
+            raise RuntimeError("This GPU's driver does not allow core clock writes")
+        if mem_t != cur["memory"][0] and not self.pstates_write_ok:
+            raise RuntimeError("This GPU's driver does not allow memory clock writes")
+        if core_t != cur["core"][0]:
+            if self.boost_ok:
+                self._boost_write(core_t)
+            else:
+                self._pstates_apply(int(round(core_t * 1000)),
+                                    int(round(cur["memory"][0] * 1000)))
+        if mem_t != cur["memory"][0]:
+            self._pstates_apply(int(round(core_t * 1000)), int(round(mem_t * 1000)))
         time.sleep(0.05)
-        verify = self._deltas(self._get())
-        for domain, khz in ((NV_CLOCK_GRAPHICS, desired[0]), (NV_CLOCK_MEMORY, desired[1])):
-            if verify.get(domain, (None,))[0] != khz:
-                raise RuntimeError("Driver readback differs from the request; check GPU state")
+        verify = self.read()
+        if verify["core"][0] != core_t or verify["memory"][0] != mem_t:
+            raise RuntimeError("Driver readback differs from the request; check GPU state")
         try:
-            self.set_power(not reset and any(desired))
+            self.set_power(bool(core_t or mem_t))
         except Exception:
             pass
-        return self.read()
+        return verify
 
     def close(self):
         if self.dll and self.gpu:
@@ -1405,7 +1483,9 @@ class CoolingApp:
         elif not self.component_connection_ready() or self.gpu_busy or self.gpu_reset_failed:
             problem = "Wait for GPU clock readback and resolve any reset failure first."
         elif preset[key] <= info[key][3]:
-            problem = "The saved preset has no overclock for this component."
+            problem = ("This GPU's driver does not allow adjusting this clock"
+                       if info[key][2] <= info[key][3]
+                       else "The saved preset has no overclock for this component.")
         elif not info["is_default"] and not self.gpu_owned:
             problem = "Clock offsets from another app are active; press GPU OFF / Reset first."
         else:
