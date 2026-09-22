@@ -2571,7 +2571,8 @@ class CoolingApp:
         dlg.transient(self.root)
         dlg.attributes("-topmost", True)
         dlg.configure(bg="#1e1f24")
-        ttk.Label(dlg, text=f'"{name}" is using about {cpu:.0f}% CPU while your game is running.\n'
+        cpu_pct = min(100.0, cpu / max(1, os.cpu_count() or 1))
+        ttk.Label(dlg, text=f'"{name}" is using about {cpu_pct:.0f}% of your CPU while your game is running.\n'
                             "Close it to free resources?",
                   wraplength=360).pack(padx=16, pady=(14, 8))
         row = ttk.Frame(dlg)
