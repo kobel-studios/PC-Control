@@ -896,6 +896,10 @@ HIGH_PRIORITY_CLASS = 0x00000080
 NORMAL_PRIORITY_CLASS = 0x00000020
 PROCESS_SET_INFORMATION = 0x0200
 HIGH_PERF_SCHEME = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+ULTIMATE_SCHEME = "e9a42b02-d5df-448d-aa00-03f14749eb61"  # hidden on Win10; created via -duplicatescheme
+SUB_PROCESSOR = "54533251-82be-4824-96c1-47b60b740d00"      # powercfg subgroup
+CPMINCORES = "0cc5b647-c1df-4637-891a-dec35c318583"         # min cores unparked (%)
+STANDBY_PURGE_EVERY = 600.0  # seconds between standby-list purges while gaming
 
 # FPS cleanup: processes that must never be touched, and known non-essential
 # hogs that can be closed without asking (restartable, no unsaved work).
@@ -964,11 +968,21 @@ class GameBooster:
         self.boosted = set()
         self.denied = set()
         self.timer_raised = False
+        self.last_purge = 0.0
         try:
             self.k32 = ctypes.WinDLL("kernel32")
             self.ntdll = ctypes.WinDLL("ntdll")
         except Exception:
             self.k32 = self.ntdll = None
+
+    def purge_standby(self):
+        """Empty the standby memory list - cached pages can cause hitching
+        when a game needs RAM quickly. Same trick as ISLC's standby purge."""
+        try:
+            cmd = ctypes.c_int(4)  # MemoryPurgeStandbyList
+            self.ntdll.NtSetSystemInformation(80, ctypes.byref(cmd), 4)
+        except Exception:
+            pass
 
     def _timer(self, raise_it):
         cur = ctypes.c_ulong(0)
@@ -989,6 +1003,10 @@ class GameBooster:
             return
         if not self.timer_raised:
             self._timer(True)
+        now = time.monotonic()
+        if now - self.last_purge >= STANDBY_PURGE_EVERY:
+            self.purge_standby()
+            self.last_purge = now
         for pid in pids:
             if pid in self.boosted or pid in self.denied:
                 continue
@@ -1083,6 +1101,9 @@ class CoolingApp:
         self.running_procs = {}
         self.proc_last_scan = 0
         self.prev_power_scheme = None
+        self.prev_min_cores = None
+        self._ultimate_guid = None
+        self.dvr_saved = None
         self.gpu_fan_manual = False
         self.cpu_ratio_preset = CPU_OC_DEFAULT_RATIO
         self.cpu_ratio_from_config = False
@@ -1547,9 +1568,10 @@ class CoolingApp:
         self.game_boost_status = ttk.Label(game, text="off - boosts the listed game while it runs",
                                            wraplength=720)
         self.game_boost_status.pack(anchor="w", padx=12, pady=(0, 4))
-        ttk.Label(game, text="While a listed game runs: sets it to High CPU priority, speeds up the Windows\n"
-            "timer, and keeps the High Performance power plan active. Helps frame pacing; expect small gains.\n"
-            "Anti-cheat games (e.g. Helldivers 2) may block the priority change - the timer boost still applies.",
+        ttk.Label(game, text="While a listed game runs: High CPU priority, faster Windows timer, Ultimate\n"
+            "Performance power plan, all CPU cores unparked, and standby memory purged to cut hitching.\n"
+            "Also turns off Game DVR/Game Bar recording and enables Game Mode while boost is on. Small but real\n"
+            "gains, mostly smoother frame pacing. Anti-cheat (e.g. Helldivers 2) may block the priority part.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
         crow = ttk.Frame(game)
         crow.pack(fill="x", padx=8, pady=6)
@@ -2512,9 +2534,93 @@ class CoolingApp:
             self.boosting_games = set()
             self.game_booster.release()
             self._restore_power_scheme()
+            self._game_dvr(False)
             self.game_boost_status.config(text="off - boosts the listed game while it runs")
         else:
+            self._game_dvr(True)
             self.game_boost_status.config(text="watching for a listed game...")
+
+    def _game_dvr(self, off):
+        """Game DVR background recording and Game Bar overlay cost frames.
+        Off while boost is enabled, restored when boost is turned off.
+        Values are read at game launch, so toggling takes effect on the
+        next game start."""
+        import winreg
+        keys = [(r"System\GameConfigStore", "GameDVR_Enabled", 0),
+                (r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR", "AllowGameDVR", 0)]
+        if off:
+            if self.dvr_saved is not None:
+                return
+            saved = {}
+            for path, name, val in keys:
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                        try:
+                            saved[(path, name)] = winreg.QueryValueEx(key, name)[0]
+                        except OSError:
+                            saved[(path, name)] = None
+                        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, val)
+                except OSError:
+                    pass
+            self.dvr_saved = saved
+            try:
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\GameBar")
+                winreg.SetValueEx(key, "AllowAutoGameMode", 0, winreg.REG_DWORD, 1)
+                winreg.CloseKey(key)
+            except OSError:
+                pass
+        else:
+            if self.dvr_saved is None:
+                return
+            for (path, name), prev in self.dvr_saved.items():
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                        winreg.KEY_SET_VALUE) as key:
+                        if prev is None:
+                            winreg.DeleteValue(key, name)
+                        else:
+                            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, prev)
+                except OSError:
+                    pass
+            self.dvr_saved = None
+
+    def _ultimate_scheme(self):
+        """GUID of the Ultimate Performance plan, creating it once if missing.
+        Win10 ships it hidden on most installs."""
+        if self._ultimate_guid is None:
+            self._ultimate_guid = ""
+            try:
+                out = subprocess.run(["powercfg", "/list"], capture_output=True,
+                                     text=True, timeout=10,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                for line in out.splitlines():
+                    if "ultimate" in line.lower():
+                        m = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", line)
+                        if m:
+                            self._ultimate_guid = m.group(0)
+                            break
+                if not self._ultimate_guid:
+                    out = subprocess.run(["powercfg", "/duplicatescheme", ULTIMATE_SCHEME],
+                                         capture_output=True, text=True, timeout=10,
+                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                    m = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", out)
+                    if m:
+                        self._ultimate_guid = m.group(0)
+            except Exception:
+                pass
+        return self._ultimate_guid or None
+
+    def _set_core_parking(self, pct):
+        """Min unparked CPU cores (0-100). Windows parks cores to save power;
+        parked cores add latency when a game suddenly needs them."""
+        subprocess.run(["powercfg", "/setacvalueindex", "SCHEME_CURRENT",
+                        SUB_PROCESSOR, CPMINCORES, str(pct)],
+                       capture_output=True, timeout=10,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["powercfg", "/setactive", "SCHEME_CURRENT"],
+                       capture_output=True, timeout=10,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def _apply_power_scheme(self):
         try:
@@ -2523,20 +2629,32 @@ class CoolingApp:
                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
             m = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", out)
             self.prev_power_scheme = m.group(0) if m else None
-            if self.prev_power_scheme != HIGH_PERF_SCHEME:
-                subprocess.run(["powercfg", "/setactive", HIGH_PERF_SCHEME], timeout=10,
+            target = self._ultimate_scheme() or HIGH_PERF_SCHEME
+            if self.prev_power_scheme != target:
+                subprocess.run(["powercfg", "/setactive", target], timeout=10,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # Save then max out core parking on the gaming scheme.
+            q = subprocess.run(["powercfg", "/query", "SCHEME_CURRENT",
+                                SUB_PROCESSOR, CPMINCORES],
+                               capture_output=True, text=True, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            m = re.search(r"Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)", q)
+            self.prev_min_cores = int(m.group(1), 16) if m else None
+            self._set_core_parking(100)
         except Exception:
             pass
 
     def _restore_power_scheme(self):
         try:
+            if self.prev_min_cores is not None:
+                self._set_core_parking(self.prev_min_cores)
             if self.prev_power_scheme and self.prev_power_scheme != HIGH_PERF_SCHEME:
                 subprocess.run(["powercfg", "/setactive", self.prev_power_scheme], timeout=10,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception:
             pass
         self.prev_power_scheme = None
+        self.prev_min_cores = None
 
     def tick_game(self, now):
         enabled = self.game_boost_value.get()
@@ -2553,7 +2671,7 @@ class CoolingApp:
             self.game_booster.apply([p for ps in matched.values() for p in ps])
             self.boosting_games = set(matched)
             txt = ("boosting " + ", ".join(sorted(matched))
-                   + " - high priority + fast timer + high perf plan")
+                   + " - priority + timer + ultimate perf + unparked cores")
             if self.game_booster.denied:
                 txt += f" ({len(self.game_booster.denied)} protected by anti-cheat)"
             self.game_boost_status.config(text=txt)

@@ -106,6 +106,70 @@ class GameBoostTests(unittest.TestCase):
         self.assertIn(1234, booster.denied)
         booster.k32.SetPriorityClass.assert_not_called()
 
+    def test_booster_apply_purges_standby(self):
+        booster = gui.GameBooster()
+        booster.k32 = Mock()
+        booster.ntdll = Mock()
+        booster.k32.OpenProcess.return_value = 99
+        booster.apply([1234])
+        booster.ntdll.NtSetSystemInformation.assert_called_once()
+
+    def test_ultimate_scheme_and_unparking(self):
+        self.app.game_boost_value.set(True)
+        self.app.running_procs = {"helldivers2.exe": [1234]}
+        prev_scheme = "381b4222-f694-41f0-9685-ff5bb260df2e"
+
+        def fake_run(cmd, **kw):
+            out = Mock(stdout="")
+            if cmd[1] == "/getactivescheme":
+                out.stdout = f"Power Scheme GUID: {prev_scheme}  (Balanced)"
+            elif cmd[1] == "/list":
+                out.stdout = f"Power Scheme GUID: {gui.ULTIMATE_SCHEME}  (Ultimate Performance)"
+            elif cmd[1] == "/query":
+                out.stdout = "Current AC Power Setting Index: 0x0000000a"
+            return out
+
+        with patch.object(gui.subprocess, "run", side_effect=fake_run) as run:
+            self.app.tick_game(0)
+        calls = [c.args[0] for c in run.call_args_list]
+        self.assertIn(["powercfg", "/setactive", gui.ULTIMATE_SCHEME], calls)
+        self.assertIn(["powercfg", "/setacvalueindex", "SCHEME_CURRENT",
+                       gui.SUB_PROCESSOR, gui.CPMINCORES, "100"], calls)
+
+        self.app.running_procs = {}
+        with patch.object(gui.subprocess, "run", side_effect=fake_run) as run2:
+            self.app.tick_game(1)
+        calls2 = [c.args[0] for c in run2.call_args_list]
+        self.assertIn(["powercfg", "/setacvalueindex", "SCHEME_CURRENT",
+                       gui.SUB_PROCESSOR, gui.CPMINCORES, "10"], calls2)
+        self.assertIn(["powercfg", "/setactive", prev_scheme], calls2)
+
+    def test_game_dvr_disabled_and_restored(self):
+        store = {}
+        fake_key = Mock()
+        fake_key.__enter__ = lambda s: s
+        fake_key.__exit__ = lambda s, *a: False
+
+        def query(key, name):
+            if name not in store:
+                raise OSError()
+            return (store[name], 4)
+
+        with patch("winreg.OpenKey", return_value=fake_key), \
+                patch("winreg.QueryValueEx", side_effect=query), \
+                patch("winreg.SetValueEx",
+                      side_effect=lambda k, n, t, ty, v: store.__setitem__(n, v)), \
+                patch("winreg.DeleteValue",
+                      side_effect=lambda k, n: store.pop(n, None)), \
+                patch("winreg.CreateKey", return_value=fake_key), \
+                patch("winreg.CloseKey"):
+            self.app._game_dvr(True)
+            self.assertEqual(store.get("GameDVR_Enabled"), 0)
+            self.assertEqual(store.get("AllowGameDVR"), 0)
+            self.app._game_dvr(False)
+            self.assertNotIn("GameDVR_Enabled", store)  # absent before -> deleted
+            self.assertIsNone(self.app.dvr_saved)
+
     def test_booster_release_restores(self):
         booster = gui.GameBooster()
         booster.k32 = Mock()
