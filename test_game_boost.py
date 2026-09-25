@@ -170,6 +170,45 @@ class GameBoostTests(unittest.TestCase):
             self.assertNotIn("GameDVR_Enabled", store)  # absent before -> deleted
             self.assertIsNone(self.app.dvr_saved)
 
+    def test_dethrottle_called_for_boosted_pid(self):
+        booster = gui.GameBooster()
+        booster.k32 = Mock()
+        booster.ntdll = Mock()
+        booster.k32.OpenProcess.return_value = 99
+        booster.apply([1234])
+        booster.k32.SetProcessInformation.assert_called_once()
+        booster.ntdll.NtSetInformationProcess.assert_called_once()
+
+    def test_services_paused_and_resumed(self):
+        self.app.game_boost_value.set(True)
+        self.app.running_procs = {"helldivers2.exe": [1234]}
+        self.app._apply_power_scheme = Mock()
+
+        def fake_run(cmd, **kw):
+            out = Mock(stdout="")
+            if cmd[0] == "sc" and len(cmd) == 3:
+                out.stdout = "        STATE              : 4  RUNNING\n"
+            elif cmd[0] == "sc":  # full service enum
+                out.stdout = ("SERVICE_NAME: BcastDVRUserService_abc\n"
+                              "        STATE              : 4  RUNNING\n\n"
+                              "SERVICE_NAME: someothersvc\n"
+                              "        STATE              : 1  STOPPED\n")
+            return out
+
+        with patch.object(gui.subprocess, "run", side_effect=fake_run) as run:
+            self.app.tick_game(0)
+        calls = [c.args[0] for c in run.call_args_list]
+        self.assertIn(["net", "stop", "wuauserv"], calls)
+        self.assertIn(["net", "stop", "BcastDVRUserService_abc"], calls)
+        self.assertNotIn(["net", "stop", "someothersvc"], calls)
+
+        self.app.running_procs = {}
+        with patch.object(gui.subprocess, "run", side_effect=fake_run) as run2:
+            self.app.tick_game(1)
+        calls2 = [c.args[0] for c in run2.call_args_list]
+        self.assertIn(["net", "start", "wuauserv"], calls2)
+        self.assertIn(["net", "start", "BcastDVRUserService_abc"], calls2)
+
     def test_booster_release_restores(self):
         booster = gui.GameBooster()
         booster.k32 = Mock()

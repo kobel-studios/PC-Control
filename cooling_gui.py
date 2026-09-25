@@ -899,6 +899,14 @@ HIGH_PERF_SCHEME = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 ULTIMATE_SCHEME = "e9a42b02-d5df-448d-aa00-03f14749eb61"  # hidden on Win10; created via -duplicatescheme
 SUB_PROCESSOR = "54533251-82be-4824-96c1-47b60b740d00"      # powercfg subgroup
 CPMINCORES = "0cc5b647-c1df-4637-891a-dec35c318583"         # min cores unparked (%)
+PERFBOOSTMODE = "be337238-0d82-4146-a960-4f3749d470c7"      # boost aggressiveness (2 = Aggressive)
+IDLEDISABLE = "5d76a2ca-e8c0-402f-a133-2158492d58ad"        # disable C-states (1 = no idle)
+# AC settings applied to the gaming power scheme while a listed game runs;
+# previous values are restored afterwards.
+BOOST_POWER_SETTINGS = {CPMINCORES: "100", PERFBOOSTMODE: "2", IDLEDISABLE: "1"}
+# Demand-start services paused while gaming (downloads/updates/xbox junk);
+# resumed on game exit. NOT XboxGipSvc - that handles controller input.
+BOOST_PAUSE_SERVICES = ("wuauserv", "usosvc", "dosvc", "xblgamesave", "xboxnetapisvc")
 STANDBY_PURGE_EVERY = 600.0  # seconds between standby-list purges while gaming
 
 # FPS cleanup: processes that must never be touched, and known non-essential
@@ -958,6 +966,12 @@ CLEANUP_RECLOSE_AFTER = 120.0  # respawned apps can be closed again after this
 TIMER_RES_100NS = 5000  # 0.5 ms
 
 
+class POWER_THROTTLE_STATE(ctypes.Structure):
+    _fields_ = [("Version", ctypes.c_ulong),
+                ("ControlMask", ctypes.c_ulong),
+                ("StateMask", ctypes.c_ulong)]
+
+
 class GameBooster:
     """High process priority + fast system timer while a listed game runs.
 
@@ -1010,7 +1024,31 @@ class GameBooster:
         for pid in pids:
             if pid in self.boosted or pid in self.denied:
                 continue
-            (self.boosted if self._set_priority(pid, HIGH_PRIORITY_CLASS) else self.denied).add(pid)
+            if self._set_priority(pid, HIGH_PRIORITY_CLASS):
+                self.boosted.add(pid)
+                self._dethrottle(pid)
+            else:
+                self.denied.add(pid)
+
+    def _dethrottle(self, pid):
+        """Best-effort per-process wins: opt the game out of EcoQoS power
+        throttling and raise its I/O priority for asset streaming."""
+        h = self.k32.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+        if not h:
+            return
+        try:
+            try:
+                st = POWER_THROTTLE_STATE(1, 1, 0)  # version, mask=EXECUTION_SPEED, state=off
+                self.k32.SetProcessInformation(h, 4, ctypes.byref(st), ctypes.sizeof(st))
+            except Exception:
+                pass
+            try:
+                iop = ctypes.c_ulong(3)  # IoPriorityHigh
+                self.ntdll.NtSetInformationProcess(h, 33, ctypes.byref(iop), 4)  # ProcessIoPriority
+            except Exception:
+                pass
+        finally:
+            self.k32.CloseHandle(h)
 
     def release(self):
         if not self.k32:
@@ -1101,7 +1139,8 @@ class CoolingApp:
         self.running_procs = {}
         self.proc_last_scan = 0
         self.prev_power_scheme = None
-        self.prev_min_cores = None
+        self.prev_power_settings = {}
+        self.paused_services = []
         self._ultimate_guid = None
         self.dvr_saved = None
         self.gpu_fan_manual = False
@@ -1568,10 +1607,10 @@ class CoolingApp:
         self.game_boost_status = ttk.Label(game, text="off - boosts the listed game while it runs",
                                            wraplength=720)
         self.game_boost_status.pack(anchor="w", padx=12, pady=(0, 4))
-        ttk.Label(game, text="While a listed game runs: High CPU priority, faster Windows timer, Ultimate\n"
-            "Performance power plan, all CPU cores unparked, and standby memory purged to cut hitching.\n"
-            "Also turns off Game DVR/Game Bar recording and enables Game Mode while boost is on. Small but real\n"
-            "gains, mostly smoother frame pacing. Anti-cheat (e.g. Helldivers 2) may block the priority part.",
+        ttk.Label(game, text="While a listed game runs: High CPU + I/O priority, faster Windows timer, Ultimate\n"
+            "Performance plan, cores unparked with aggressive boost and no idle sleep, standby memory purged,\n"
+            "Windows Update and Xbox background services paused. Game DVR/Game Bar recording off and Game Mode\n"
+            "on while boost is enabled. Small but real gains, mostly smoother pacing. Anti-cheat may block priority.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
         crow = ttk.Frame(game)
         crow.pack(fill="x", padx=8, pady=6)
@@ -2534,6 +2573,7 @@ class CoolingApp:
             self.boosting_games = set()
             self.game_booster.release()
             self._restore_power_scheme()
+            self._resume_services()
             self._game_dvr(False)
             self.game_boost_status.config(text="off - boosts the listed game while it runs")
         else:
@@ -2611,50 +2651,85 @@ class CoolingApp:
                 pass
         return self._ultimate_guid or None
 
-    def _set_core_parking(self, pct):
-        """Min unparked CPU cores (0-100). Windows parks cores to save power;
-        parked cores add latency when a game suddenly needs them."""
-        subprocess.run(["powercfg", "/setacvalueindex", "SCHEME_CURRENT",
-                        SUB_PROCESSOR, CPMINCORES, str(pct)],
-                       capture_output=True, timeout=10,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        subprocess.run(["powercfg", "/setactive", "SCHEME_CURRENT"],
-                       capture_output=True, timeout=10,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    def _powercfg(self, args):
+        return subprocess.run(["powercfg"] + args, capture_output=True,
+                              text=True, timeout=10,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def _apply_power_scheme(self):
         try:
-            out = subprocess.run(["powercfg", "/getactivescheme"], capture_output=True,
-                                 text=True, timeout=10,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            out = self._powercfg(["/getactivescheme"]).stdout
             m = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", out)
             self.prev_power_scheme = m.group(0) if m else None
             target = self._ultimate_scheme() or HIGH_PERF_SCHEME
             if self.prev_power_scheme != target:
-                subprocess.run(["powercfg", "/setactive", target], timeout=10,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            # Save then max out core parking on the gaming scheme.
-            q = subprocess.run(["powercfg", "/query", "SCHEME_CURRENT",
-                                SUB_PROCESSOR, CPMINCORES],
-                               capture_output=True, text=True, timeout=10,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-            m = re.search(r"Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)", q)
-            self.prev_min_cores = int(m.group(1), 16) if m else None
-            self._set_core_parking(100)
+                self._powercfg(["/setactive", target])
+            # Save each setting's AC value on the gaming scheme, then apply
+            # the boost values: unpark all cores, aggressive boost, no idle.
+            self.prev_power_settings = {}
+            for guid, val in BOOST_POWER_SETTINGS.items():
+                q = self._powercfg(["/query", "SCHEME_CURRENT", SUB_PROCESSOR, guid]).stdout
+                m = re.search(r"Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)", q)
+                if m:
+                    self.prev_power_settings[guid] = int(m.group(1), 16)
+                self._powercfg(["/setacvalueindex", "SCHEME_CURRENT",
+                                SUB_PROCESSOR, guid, val])
+            self._powercfg(["/setactive", "SCHEME_CURRENT"])
         except Exception:
             pass
 
     def _restore_power_scheme(self):
         try:
-            if self.prev_min_cores is not None:
-                self._set_core_parking(self.prev_min_cores)
+            for guid, prev in self.prev_power_settings.items():
+                self._powercfg(["/setacvalueindex", "SCHEME_CURRENT",
+                                SUB_PROCESSOR, guid, str(prev)])
+            if self.prev_power_settings:
+                self._powercfg(["/setactive", "SCHEME_CURRENT"])
             if self.prev_power_scheme and self.prev_power_scheme != HIGH_PERF_SCHEME:
-                subprocess.run(["powercfg", "/setactive", self.prev_power_scheme], timeout=10,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self._powercfg(["/setactive", self.prev_power_scheme])
         except Exception:
             pass
         self.prev_power_scheme = None
-        self.prev_min_cores = None
+        self.prev_power_settings = {}
+
+    def _pause_services(self):
+        """Stop demand-start services that download/update or write telemetry
+        mid-game. Anything we stopped is restarted on game exit."""
+        self.paused_services = []
+        for svc in BOOST_PAUSE_SERVICES:
+            try:
+                q = subprocess.run(["sc", "query", svc], capture_output=True, text=True,
+                                   timeout=10,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                if "RUNNING" in q.upper():
+                    subprocess.run(["net", "stop", svc], capture_output=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self.paused_services.append(svc)
+            except Exception:
+                pass
+        # Per-user Game Bar presence writer (name has a random suffix).
+        try:
+            out = subprocess.run(["sc", "query", "type=", "service", "state=", "all"],
+                                 capture_output=True, text=True, timeout=15,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            for block in re.split(r"\n\s*\n", out):
+                m = re.search(r"SERVICE_NAME:\s*(\S*bcastdvr\w*)", block, re.I)
+                if m and "RUNNING" in block.upper():
+                    svc = m.group(1)
+                    subprocess.run(["net", "stop", svc], capture_output=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self.paused_services.append(svc)
+        except Exception:
+            pass
+
+    def _resume_services(self):
+        for svc in self.paused_services:
+            try:
+                subprocess.run(["net", "start", svc], capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                pass
+        self.paused_services = []
 
     def tick_game(self, now):
         enabled = self.game_boost_value.get()
@@ -2668,6 +2743,7 @@ class CoolingApp:
         if matched:
             if not self.boosting_games:
                 self._apply_power_scheme()
+                self._pause_services()
             self.game_booster.apply([p for ps in matched.values() for p in ps])
             self.boosting_games = set(matched)
             txt = ("boosting " + ", ".join(sorted(matched))
@@ -2680,6 +2756,7 @@ class CoolingApp:
                 self.boosting_games = set()
                 self.game_booster.release()
                 self._restore_power_scheme()
+                self._resume_services()
             self.game_boost_status.config(
                 text="watching for a listed game..." if enabled
                 else "off - boosts the listed game while it runs")
@@ -2830,6 +2907,7 @@ class CoolingApp:
             self.nvapi.close()
         self.game_booster.release()
         self._restore_power_scheme()
+        self._resume_services()
         self.stop_components("Closing: overclock requests off")
         if self.cpu_oc_active:
             self.cpu_reset("Closing: restoring stock CPU ratio limit")
