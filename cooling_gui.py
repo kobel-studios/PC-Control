@@ -905,6 +905,12 @@ SUB_USB = "2a737441-1930-4402-8d77-b2bebba308a3"            # USB subgroup
 SUB_PCIEXPRESS = "501a4d13-42af-4429-9fd1-a8218c268e20"     # PCIe subgroup
 USB_SUSPEND = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"        # USB selective suspend
 PCIE_ASPM = "ee12f906-d277-404b-b6da-e5fa1a576df5"          # PCIe link power saving
+SUB_SLEEP = "238c9fa8-0aad-41ed-83f4-97be242c8f20"          # sleep subgroup
+SUB_DISK = "0012ee47-9041-4b5d-9b77-535fba8b1442"           # hard disk subgroup
+SUB_VIDEO = "7516b95f-f776-4464-8c53-06167f40cc99"          # display subgroup
+STANDBYIDLE = "29f6c1db-86da-48c5-9fdb-f2b67b1f44da"        # sleep after
+DISKIDLE = "6738e2c4-e8a5-4a42-b16a-e040e769756e"           # disk off after
+VIDEOIDLE = "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e"          # display off after
 # AC settings applied to the gaming power scheme while a listed game runs;
 # previous values are restored afterwards.
 BOOST_POWER_SETTINGS = {
@@ -913,12 +919,33 @@ BOOST_POWER_SETTINGS = {
     (SUB_PROCESSOR, IDLEDISABLE): "1",       # no C-state sleep
     (SUB_USB, USB_SUSPEND): "0",             # no USB suspend latency
     (SUB_PCIEXPRESS, PCIE_ASPM): "0",        # no PCIe link power-saving
+    (SUB_SLEEP, STANDBYIDLE): "0",           # never sleep mid-game
+    (SUB_DISK, DISKIDLE): "0",               # disk never spins down
+    (SUB_VIDEO, VIDEOIDLE): "0",             # monitor never times out
 }
 # Demand-start services paused while gaming (downloads/updates/telemetry/
 # xbox junk). Resumed on game exit. NOT XboxGipSvc - that handles controllers.
 BOOST_PAUSE_SERVICES = ("wuauserv", "usosvc", "dosvc", "xblgamesave",
                         "xboxnetapisvc", "sysmain", "wsearch", "diagtrack",
                         "mapsbroker", "lfsvc", "wisvc")
+# Scheduled tasks paused while gaming - CompatTelRunner is a notorious CPU
+# hog, defrag can hit the disk mid-fight. Re-enabled on game exit.
+BOOST_PAUSE_TASKS = (
+    r"\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
+    r"\Microsoft\Windows\Application Experience\ProgramDataUpdater",
+    r"\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+    r"\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
+    r"\Microsoft\Windows\Defrag\ScheduledDefrag",
+    r"\Microsoft\Windows\WindowsUpdate\Scheduled Start",
+)
+# TCP globals lowered for latency while boost is on; previous values restored.
+NETSH_TCP_OFF = {"chimney": "disabled", "ecncapability": "disabled",
+                 "timestamps": "disabled"}
+NETSH_TCP_LABELS = {"Chimney Offload State": "chimney",
+                    "ECN Capability": "ecncapability",
+                    "Timestamps": "timestamps"}
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+PROC_BOOST_RIGHTS = 0x0200 | 0x0100 | 0x1000  # SET_INFORMATION|SET_QUOTA|QUERY_LIMITED
 # Registry tweaks applied while Game Boost is on, restored when it's turned
 # off. (hive, path, name, value, kind)
 BOOST_REG_TWEAKS = (
@@ -942,6 +969,8 @@ BOOST_REG_TWEAKS = (
     ("HKCU", r"System\GameConfigStore", "GameDVR_Enabled", 0, "dword"),
     ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR",
      "AllowGameDVR", 0, "dword"),
+    ("HKLM", r"SYSTEM\CurrentControlSet\Control\Power\PowerThrottling",
+     "PowerThrottlingOff", 1, "dword"),           # no EcoQoS system-wide
 )
 TCPIP_IFACES = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
 APPCOMPAT_LAYERS = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
@@ -1085,6 +1114,11 @@ class GameBooster:
                 self.ntdll.NtSetInformationProcess(h, 33, ctypes.byref(iop), 4)  # ProcessIoPriority
             except Exception:
                 pass
+            try:
+                pp = ctypes.c_ulong(5)  # page priority 5 = highest
+                self.ntdll.NtSetInformationProcess(h, 39, ctypes.byref(pp), 4)  # ProcessPagePriority
+            except Exception:
+                pass
         finally:
             self.k32.CloseHandle(h)
 
@@ -1183,6 +1217,10 @@ class CoolingApp:
         self.tweak_saved = {}
         self.compat_saved = {}
         self.compat_pids = set()
+        self.paused_tasks = []
+        self.netsh_saved = {}
+        self.nic_power_saved = None
+        self.depri_pids = set()
         self.gpu_fan_manual = False
         self.cpu_ratio_preset = CPU_OC_DEFAULT_RATIO
         self.cpu_ratio_from_config = False
@@ -1647,11 +1685,12 @@ class CoolingApp:
         self.game_boost_status = ttk.Label(game, text="off - boosts the listed game while it runs",
                                            wraplength=720)
         self.game_boost_status.pack(anchor="w", padx=12, pady=(0, 4))
-        ttk.Label(game, text="While a listed game runs: High CPU + I/O priority, faster Windows timer, Ultimate\n"
-            "Performance plan, cores unparked, aggressive boost, no idle sleep, no USB/PCIe power saving, standby\n"
-            "memory purged, Windows Update/Search/telemetry services paused. While boost is on: Game DVR off,\n"
-            "Game Mode on, no network throttling (Nagle off), foreground priority boost, best-performance visuals,\n"
-            "and exclusive-fullscreen compat for listed games. Everything restores when boost is turned off.",
+        ttk.Label(game, text="While a listed game runs: High CPU/I/O/memory priority, fast timer, standby purge,\n"
+            "Ultimate plan with cores unparked, aggressive boost, no idle sleep, and no sleep/disk/display/USB/PCIe\n"
+            "power saving. Background apps drop to low priority and give RAM back. Update/Search/telemetry/defrag\n"
+            "services and tasks pause; NIC power saving off. While boost is on: Game DVR off, Game Mode on, no\n"
+            "network throttling (Nagle/ECN/offload off), foreground CPU boost, best-performance visuals, and\n"
+            "exclusive-fullscreen compat for listed games. Everything restores when the game exits or boost is off.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
         crow = ttk.Frame(game)
         crow.pack(fill="x", padx=8, pady=6)
@@ -2615,10 +2654,16 @@ class CoolingApp:
             self.game_booster.release()
             self._restore_power_scheme()
             self._resume_services()
+            self._resume_tasks()
+            self._restore_background()
             self._boost_tweaks(False)
+            self._netsh_tweaks(False)
+            self._nic_power(False)
             self.game_boost_status.config(text="off - boosts the listed game while it runs")
         else:
             self._boost_tweaks(True)
+            self._netsh_tweaks(True)
+            self._nic_power(True)
             self.game_boost_status.config(text="watching for a listed game...")
 
     def _reg_set(self, hive, path, name, val, kind="dword"):
@@ -2884,6 +2929,138 @@ class CoolingApp:
                 pass
         self.paused_services = []
 
+    def _pause_tasks(self):
+        """Disable scheduled tasks that can fire mid-game (telemetry, defrag,
+        update scans). Only tasks that were enabled get re-enabled after."""
+        self.paused_tasks = []
+        for tn in BOOST_PAUSE_TASKS:
+            try:
+                q = subprocess.run(["schtasks", "/query", "/tn", tn, "/fo", "csv", "/nh"],
+                                   capture_output=True, text=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                if not q.strip() or '"Disabled"' in q:
+                    continue
+                subprocess.run(["schtasks", "/change", "/tn", tn, "/disable"],
+                               capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.paused_tasks.append(tn)
+            except Exception:
+                pass
+
+    def _resume_tasks(self):
+        for tn in self.paused_tasks:
+            try:
+                subprocess.run(["schtasks", "/change", "/tn", tn, "/enable"],
+                               capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                pass
+        self.paused_tasks = []
+
+    def _deprioritize_background(self):
+        """Process-Lasso lite: non-protected background processes drop to
+        Below Normal priority and get their working set trimmed so the game
+        wins every CPU/RAM fight. Restored to Normal on game exit."""
+        k32 = self.game_booster.k32
+        if not k32:
+            return
+        protected = CLEANUP_PROTECTED | self.cleanup_never | self._cleanup_game_names()
+        for name, pids in self.running_procs.items():
+            if name in protected:
+                continue
+            for pid in pids:
+                if (pid == os.getpid() or pid in self.depri_pids
+                        or pid in self.game_booster.boosted):
+                    continue
+                h = k32.OpenProcess(PROC_BOOST_RIGHTS, False, pid)
+                if not h:
+                    continue
+                try:
+                    if k32.SetPriorityClass(h, BELOW_NORMAL_PRIORITY_CLASS):
+                        self.depri_pids.add(pid)
+                    try:
+                        k32.SetProcessWorkingSetSize(
+                            h, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+                    except Exception:
+                        pass
+                finally:
+                    k32.CloseHandle(h)
+
+    def _restore_background(self):
+        k32 = self.game_booster.k32
+        if not k32:
+            return
+        for pid in list(self.depri_pids):
+            h = k32.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+            if h:
+                try:
+                    k32.SetPriorityClass(h, NORMAL_PRIORITY_CLASS)
+                finally:
+                    k32.CloseHandle(h)
+        self.depri_pids = set()
+
+    def _netsh_tweaks(self, on):
+        """TCP globals: offload/ECN/timestamps off while boosting for lower
+        packet latency. Previous values restored when boost is turned off."""
+        try:
+            if on:
+                if self.netsh_saved:
+                    return
+                out = subprocess.run(["netsh", "int", "tcp", "show", "global"],
+                                     capture_output=True, text=True, timeout=15,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                self.netsh_saved = {}
+                for label, key in NETSH_TCP_LABELS.items():
+                    m = re.search(re.escape(label) + r"\s*:\s*(\S+)", out, re.I)
+                    if m:
+                        self.netsh_saved[key] = m.group(1)
+                    subprocess.run(["netsh", "int", "tcp", "set", "global",
+                                    f"{key}={NETSH_TCP_OFF[key]}"],
+                                   capture_output=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                for key, prev in self.netsh_saved.items():
+                    subprocess.run(["netsh", "int", "tcp", "set", "global",
+                                    f"{key}={prev}"],
+                                   capture_output=True, timeout=15,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.netsh_saved = {}
+        except Exception:
+            pass
+
+    def _nic_power(self, off):
+        """Stop Windows power-managing physical NICs while boosting - adapter
+        power save can add latency. Only adapters that had it on get touched."""
+        if off:
+            if self.nic_power_saved is not None:
+                return
+            self.nic_power_saved = []
+            try:
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance MSPower_DeviceEnable -Namespace root/wmi "
+                     "-ErrorAction SilentlyContinue | Where-Object {$_.Enable -and "
+                     "$_.InstanceName -match 'PCI\\\\VEN'} | ForEach-Object "
+                     "{$_.InstanceName; Set-CimInstance -InputObject $_ -Property @{Enable=$false}}"],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                self.nic_power_saved = [l.strip() for l in out.splitlines() if l.strip()]
+            except Exception:
+                pass
+        else:
+            for inst in self.nic_power_saved or []:
+                try:
+                    esc = inst.replace("'", "''")
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-CimInstance MSPower_DeviceEnable -Namespace root/wmi "
+                         f"-Filter \"InstanceName='{esc}'\" | Set-CimInstance -Property @{{Enable=$true}}"],
+                        capture_output=True, timeout=30,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                except Exception:
+                    pass
+            self.nic_power_saved = None
+
     def tick_game(self, now):
         enabled = self.game_boost_value.get()
         wanted = {n.strip().lower() for n in self.game_exes_var.get().split(",") if n.strip()}
@@ -2897,10 +3074,14 @@ class CoolingApp:
             if not self.boosting_games:
                 self._apply_power_scheme()
                 self._pause_services()
+                self._pause_tasks()
                 self._boost_tweaks(True)
+                self._netsh_tweaks(True)
+                self._nic_power(True)
             game_pids = [p for ps in matched.values() for p in ps]
             self.game_booster.apply(game_pids)
             self._compat_game_exes(game_pids)
+            self._deprioritize_background()
             self.boosting_games = set(matched)
             txt = ("boosting " + ", ".join(sorted(matched))
                    + " - priority + timer + ultimate perf + unparked cores")
@@ -2913,6 +3094,8 @@ class CoolingApp:
                 self.game_booster.release()
                 self._restore_power_scheme()
                 self._resume_services()
+                self._resume_tasks()
+                self._restore_background()
             self.game_boost_status.config(
                 text="watching for a listed game..." if enabled
                 else "off - boosts the listed game while it runs")
@@ -3064,7 +3247,11 @@ class CoolingApp:
         self.game_booster.release()
         self._restore_power_scheme()
         self._resume_services()
+        self._resume_tasks()
+        self._restore_background()
         self._boost_tweaks(False)
+        self._netsh_tweaks(False)
+        self._nic_power(False)
         self.stop_components("Closing: overclock requests off")
         if self.cpu_oc_active:
             self.cpu_reset("Closing: restoring stock CPU ratio limit")

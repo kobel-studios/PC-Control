@@ -35,6 +35,14 @@ class GameBoostTests(unittest.TestCase):
         self.app, self.root = make_app()
         self.app.running_procs = {}
         self.app.game_exes_var.set("helldivers2.exe")
+        # Side-effect-heavy boost steps are mocked by default; tests that
+        # exercise a step restore the real bound method from real_methods.
+        self.real_methods = {}
+        for m in ("_pause_services", "_resume_services", "_pause_tasks",
+                  "_resume_tasks", "_boost_tweaks", "_netsh_tweaks",
+                  "_nic_power", "_deprioritize_background", "_compat_game_exes"):
+            self.real_methods[m] = getattr(self.app, m)
+            setattr(self.app, m, Mock())
 
     def tearDown(self):
         teardown(self.app, self.root)
@@ -155,6 +163,7 @@ class GameBoostTests(unittest.TestCase):
                 raise OSError()
             return (store[name], 4)
 
+        self.app._boost_tweaks = self.real_methods["_boost_tweaks"]
         with patch("winreg.OpenKey", return_value=fake_key), \
                 patch("winreg.QueryValueEx", side_effect=query), \
                 patch("winreg.SetValueEx",
@@ -179,12 +188,14 @@ class GameBoostTests(unittest.TestCase):
         booster.k32.OpenProcess.return_value = 99
         booster.apply([1234])
         booster.k32.SetProcessInformation.assert_called_once()
-        booster.ntdll.NtSetInformationProcess.assert_called_once()
+        self.assertEqual(booster.ntdll.NtSetInformationProcess.call_count, 2)  # I/O + page priority
 
     def test_services_paused_and_resumed(self):
         self.app.game_boost_value.set(True)
         self.app.running_procs = {"helldivers2.exe": [1234]}
         self.app._apply_power_scheme = Mock()
+        self.app._pause_services = self.real_methods["_pause_services"]
+        self.app._resume_services = self.real_methods["_resume_services"]
 
         def fake_run(cmd, **kw):
             out = Mock(stdout="")
