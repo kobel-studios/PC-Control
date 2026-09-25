@@ -144,7 +144,7 @@ class GameBoostTests(unittest.TestCase):
                        gui.SUB_PROCESSOR, gui.CPMINCORES, "10"], calls2)
         self.assertIn(["powercfg", "/setactive", prev_scheme], calls2)
 
-    def test_game_dvr_disabled_and_restored(self):
+    def test_boost_tweaks_applied_and_restored(self):
         store = {}
         fake_key = Mock()
         fake_key.__enter__ = lambda s: s
@@ -163,12 +163,14 @@ class GameBoostTests(unittest.TestCase):
                       side_effect=lambda k, n: store.pop(n, None)), \
                 patch("winreg.CreateKey", return_value=fake_key), \
                 patch("winreg.CloseKey"):
-            self.app._game_dvr(True)
+            self.app._boost_tweaks(True)
             self.assertEqual(store.get("GameDVR_Enabled"), 0)
             self.assertEqual(store.get("AllowGameDVR"), 0)
-            self.app._game_dvr(False)
+            self.assertEqual(store.get("SystemResponsiveness"), 0)
+            self.assertEqual(store.get("Win32PrioritySeparation"), 0x26)
+            self.app._boost_tweaks(False)
             self.assertNotIn("GameDVR_Enabled", store)  # absent before -> deleted
-            self.assertIsNone(self.app.dvr_saved)
+            self.assertEqual(self.app.tweak_saved, {})
 
     def test_dethrottle_called_for_boosted_pid(self):
         booster = gui.GameBooster()

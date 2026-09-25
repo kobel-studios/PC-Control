@@ -901,12 +901,50 @@ SUB_PROCESSOR = "54533251-82be-4824-96c1-47b60b740d00"      # powercfg subgroup
 CPMINCORES = "0cc5b647-c1df-4637-891a-dec35c318583"         # min cores unparked (%)
 PERFBOOSTMODE = "be337238-0d82-4146-a960-4f3749d470c7"      # boost aggressiveness (2 = Aggressive)
 IDLEDISABLE = "5d76a2ca-e8c0-402f-a133-2158492d58ad"        # disable C-states (1 = no idle)
+SUB_USB = "2a737441-1930-4402-8d77-b2bebba308a3"            # USB subgroup
+SUB_PCIEXPRESS = "501a4d13-42af-4429-9fd1-a8218c268e20"     # PCIe subgroup
+USB_SUSPEND = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"        # USB selective suspend
+PCIE_ASPM = "ee12f906-d277-404b-b6da-e5fa1a576df5"          # PCIe link power saving
 # AC settings applied to the gaming power scheme while a listed game runs;
 # previous values are restored afterwards.
-BOOST_POWER_SETTINGS = {CPMINCORES: "100", PERFBOOSTMODE: "2", IDLEDISABLE: "1"}
-# Demand-start services paused while gaming (downloads/updates/xbox junk);
-# resumed on game exit. NOT XboxGipSvc - that handles controller input.
-BOOST_PAUSE_SERVICES = ("wuauserv", "usosvc", "dosvc", "xblgamesave", "xboxnetapisvc")
+BOOST_POWER_SETTINGS = {
+    (SUB_PROCESSOR, CPMINCORES): "100",      # unpark all cores
+    (SUB_PROCESSOR, PERFBOOSTMODE): "2",     # aggressive boost
+    (SUB_PROCESSOR, IDLEDISABLE): "1",       # no C-state sleep
+    (SUB_USB, USB_SUSPEND): "0",             # no USB suspend latency
+    (SUB_PCIEXPRESS, PCIE_ASPM): "0",        # no PCIe link power-saving
+}
+# Demand-start services paused while gaming (downloads/updates/telemetry/
+# xbox junk). Resumed on game exit. NOT XboxGipSvc - that handles controllers.
+BOOST_PAUSE_SERVICES = ("wuauserv", "usosvc", "dosvc", "xblgamesave",
+                        "xboxnetapisvc", "sysmain", "wsearch", "diagtrack",
+                        "mapsbroker", "lfsvc", "wisvc")
+# Registry tweaks applied while Game Boost is on, restored when it's turned
+# off. (hive, path, name, value, kind)
+BOOST_REG_TWEAKS = (
+    ("HKLM", r"SYSTEM\CurrentControlSet\Control\PriorityControl",
+     "Win32PrioritySeparation", 0x26, "dword"),   # short quantum + fg boost
+    ("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+     "SystemResponsiveness", 0, "dword"),          # games get the whole CPU
+    ("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+     "NetworkThrottlingIndex", 0xFFFFFFFF, "dword"),  # no net throttle
+    ("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
+     "GPU Priority", 8, "dword"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
+     "Priority", 6, "dword"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
+     "Scheduling Category", "High", "sz"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
+     "SFIO Priority", "High", "sz"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
+     "VisualFXSetting", 2, "dword"),              # best performance effects
+    ("HKCU", r"Control Panel\Desktop", "ForegroundLockTimeout", 0, "dword"),
+    ("HKCU", r"System\GameConfigStore", "GameDVR_Enabled", 0, "dword"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR",
+     "AllowGameDVR", 0, "dword"),
+)
+TCPIP_IFACES = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+APPCOMPAT_LAYERS = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
 STANDBY_PURGE_EVERY = 600.0  # seconds between standby-list purges while gaming
 
 # FPS cleanup: processes that must never be touched, and known non-essential
@@ -1142,7 +1180,9 @@ class CoolingApp:
         self.prev_power_settings = {}
         self.paused_services = []
         self._ultimate_guid = None
-        self.dvr_saved = None
+        self.tweak_saved = {}
+        self.compat_saved = {}
+        self.compat_pids = set()
         self.gpu_fan_manual = False
         self.cpu_ratio_preset = CPU_OC_DEFAULT_RATIO
         self.cpu_ratio_from_config = False
@@ -1608,9 +1648,10 @@ class CoolingApp:
                                            wraplength=720)
         self.game_boost_status.pack(anchor="w", padx=12, pady=(0, 4))
         ttk.Label(game, text="While a listed game runs: High CPU + I/O priority, faster Windows timer, Ultimate\n"
-            "Performance plan, cores unparked with aggressive boost and no idle sleep, standby memory purged,\n"
-            "Windows Update and Xbox background services paused. Game DVR/Game Bar recording off and Game Mode\n"
-            "on while boost is enabled. Small but real gains, mostly smoother pacing. Anti-cheat may block priority.",
+            "Performance plan, cores unparked, aggressive boost, no idle sleep, no USB/PCIe power saving, standby\n"
+            "memory purged, Windows Update/Search/telemetry services paused. While boost is on: Game DVR off,\n"
+            "Game Mode on, no network throttling (Nagle off), foreground priority boost, best-performance visuals,\n"
+            "and exclusive-fullscreen compat for listed games. Everything restores when boost is turned off.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
         crow = ttk.Frame(game)
         crow.pack(fill="x", padx=8, pady=6)
@@ -2574,36 +2615,77 @@ class CoolingApp:
             self.game_booster.release()
             self._restore_power_scheme()
             self._resume_services()
-            self._game_dvr(False)
+            self._boost_tweaks(False)
             self.game_boost_status.config(text="off - boosts the listed game while it runs")
         else:
-            self._game_dvr(True)
+            self._boost_tweaks(True)
             self.game_boost_status.config(text="watching for a listed game...")
 
-    def _game_dvr(self, off):
-        """Game DVR background recording and Game Bar overlay cost frames.
-        Off while boost is enabled, restored when boost is turned off.
-        Values are read at game launch, so toggling takes effect on the
-        next game start."""
+    def _reg_set(self, hive, path, name, val, kind="dword"):
+        """Save the previous value (once) then write the boost value."""
         import winreg
-        keys = [(r"System\GameConfigStore", "GameDVR_Enabled", 0),
-                (r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR", "AllowGameDVR", 0)]
-        if off:
-            if self.dvr_saved is not None:
-                return
-            saved = {}
-            for path, name, val in keys:
+        hives = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}
+        try:
+            with winreg.OpenKey(hives[hive], path, 0,
+                                winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                key_id = (hive, path, name)
+                if key_id not in self.tweak_saved:
+                    try:
+                        self.tweak_saved[key_id] = winreg.QueryValueEx(key, name)[0]
+                    except OSError:
+                        self.tweak_saved[key_id] = None
+                winreg.SetValueEx(key, name, 0,
+                                  winreg.REG_SZ if kind == "sz" else winreg.REG_DWORD, val)
+        except OSError:
+            pass
+
+    def _boost_tweaks(self, on):
+        """Registry-level gaming tweaks: DVR/Game Bar off, Game Mode on, no
+        multimedia CPU reservation, no network throttling, foreground boost,
+        best-performance visual effects, MMCSS game profile. Everything is
+        saved and restored when boost is turned off."""
+        import winreg
+        if on:
+            if not self.tweak_saved:
+                for hive, path, name, val, kind in BOOST_REG_TWEAKS:
+                    self._reg_set(hive, path, name, val, kind)
+                # Kill Nagle + delayed ACK on interfaces that have an IP.
                 try:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
-                                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
-                        try:
-                            saved[(path, name)] = winreg.QueryValueEx(key, name)[0]
-                        except OSError:
-                            saved[(path, name)] = None
-                        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, val)
-                except OSError:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, TCPIP_IFACES,
+                                        0, winreg.KEY_READ) as root_key:
+                        i = 0
+                        while True:
+                            try:
+                                sub = winreg.EnumSubKey(root_key, i)
+                            except OSError:
+                                break
+                            i += 1
+                            ipath = TCPIP_IFACES + "\\" + sub
+                            try:
+                                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ipath,
+                                                    0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as ik:
+                                    try:
+                                        ip = winreg.QueryValueEx(ik, "DhcpIPAddress")[0]
+                                    except OSError:
+                                        try:
+                                            ip = winreg.QueryValueEx(ik, "IPAddress")[0]
+                                        except OSError:
+                                            ip = ""
+                                    if not ip or ip == "0.0.0.0":
+                                        continue
+                                    for n, v in (("TCPNoDelay", 1), ("TcpDelAckTicks", 0)):
+                                        key_id = ("HKLM", ipath, n)
+                                        try:
+                                            self.tweak_saved.setdefault(
+                                                key_id, winreg.QueryValueEx(ik, n)[0])
+                                        except OSError:
+                                            self.tweak_saved.setdefault(key_id, None)
+                                        winreg.SetValueEx(ik, n, 0, winreg.REG_DWORD, v)
+                            except OSError:
+                                continue
+                except Exception:
                     pass
-            self.dvr_saved = saved
+                self._broadcast_settings()
             try:
                 key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\GameBar")
                 winreg.SetValueEx(key, "AllowAutoGameMode", 0, winreg.REG_DWORD, 1)
@@ -2611,19 +2693,90 @@ class CoolingApp:
             except OSError:
                 pass
         else:
-            if self.dvr_saved is None:
-                return
-            for (path, name), prev in self.dvr_saved.items():
+            hives = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}
+            for (hive, path, name), prev in list(self.tweak_saved.items()):
                 try:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                    with winreg.OpenKey(hives[hive], path, 0,
                                         winreg.KEY_SET_VALUE) as key:
                         if prev is None:
                             winreg.DeleteValue(key, name)
-                        else:
+                        elif isinstance(prev, int):
                             winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, prev)
+                        else:
+                            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, prev)
                 except OSError:
                     pass
-            self.dvr_saved = None
+            self.tweak_saved = {}
+            self._broadcast_settings()
+            self._compat_restore()
+
+    def _broadcast_settings(self):
+        """Tell running apps the registry changed (visual effects etc.)."""
+        try:
+            ctypes.windll.user32.SendMessageTimeoutW(
+                0xFFFF, 0x001A, 0, "Environment", 2, 1000, None)
+        except Exception:
+            pass
+
+    def _exe_paths(self, pids):
+        paths = set()
+        for pid in pids:
+            try:
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').ExecutablePath"],
+                    capture_output=True, text=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+                if out:
+                    paths.add(out)
+            except Exception:
+                pass
+        return paths
+
+    def _compat_game_exes(self, pids):
+        """Disable DX 'maximized windowed' fullscreen emulation for the game
+        exe - forces the classic exclusive-fullscreen path, which can help
+        frame pacing. Applies to the exe, so it takes effect on next launch;
+        kept while boost is enabled, restored when it's turned off."""
+        import winreg
+        new = [p for p in pids if p not in self.compat_pids]
+        if not new:
+            return
+        self.compat_pids.update(new)
+        for path in self._exe_paths(new):
+            if path in self.compat_saved:
+                continue
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPCOMPAT_LAYERS, 0,
+                                    winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+                    try:
+                        prev = winreg.QueryValueEx(key, path)[0]
+                    except OSError:
+                        prev = None
+                    self.compat_saved[path] = prev
+                    flags = prev or ""
+                    if "DISABLEDXMAXIMIZEDWINDOWEDMODE" not in flags.upper():
+                        new_flags = (flags + " DISABLEDXMAXIMIZEDWINDOWEDMODE").strip()
+                        if not new_flags.startswith("~"):
+                            new_flags = "~ " + new_flags
+                        winreg.SetValueEx(key, path, 0, winreg.REG_SZ, new_flags)
+            except OSError:
+                pass
+
+    def _compat_restore(self):
+        import winreg
+        for path, prev in list(self.compat_saved.items()):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPCOMPAT_LAYERS, 0,
+                                    winreg.KEY_SET_VALUE) as key:
+                    if prev is None:
+                        winreg.DeleteValue(key, path)
+                    else:
+                        winreg.SetValueEx(key, path, 0, winreg.REG_SZ, prev)
+            except OSError:
+                pass
+        self.compat_saved = {}
+        self.compat_pids = set()
 
     def _ultimate_scheme(self):
         """GUID of the Ultimate Performance plan, creating it once if missing.
@@ -2667,22 +2820,22 @@ class CoolingApp:
             # Save each setting's AC value on the gaming scheme, then apply
             # the boost values: unpark all cores, aggressive boost, no idle.
             self.prev_power_settings = {}
-            for guid, val in BOOST_POWER_SETTINGS.items():
-                q = self._powercfg(["/query", "SCHEME_CURRENT", SUB_PROCESSOR, guid]).stdout
+            for (sub, guid), val in BOOST_POWER_SETTINGS.items():
+                q = self._powercfg(["/query", "SCHEME_CURRENT", sub, guid]).stdout
                 m = re.search(r"Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)", q)
                 if m:
-                    self.prev_power_settings[guid] = int(m.group(1), 16)
+                    self.prev_power_settings[(sub, guid)] = int(m.group(1), 16)
                 self._powercfg(["/setacvalueindex", "SCHEME_CURRENT",
-                                SUB_PROCESSOR, guid, val])
+                                sub, guid, val])
             self._powercfg(["/setactive", "SCHEME_CURRENT"])
         except Exception:
             pass
 
     def _restore_power_scheme(self):
         try:
-            for guid, prev in self.prev_power_settings.items():
+            for (sub, guid), prev in self.prev_power_settings.items():
                 self._powercfg(["/setacvalueindex", "SCHEME_CURRENT",
-                                SUB_PROCESSOR, guid, str(prev)])
+                                sub, guid, str(prev)])
             if self.prev_power_settings:
                 self._powercfg(["/setactive", "SCHEME_CURRENT"])
             if self.prev_power_scheme and self.prev_power_scheme != HIGH_PERF_SCHEME:
@@ -2744,7 +2897,10 @@ class CoolingApp:
             if not self.boosting_games:
                 self._apply_power_scheme()
                 self._pause_services()
-            self.game_booster.apply([p for ps in matched.values() for p in ps])
+                self._boost_tweaks(True)
+            game_pids = [p for ps in matched.values() for p in ps]
+            self.game_booster.apply(game_pids)
+            self._compat_game_exes(game_pids)
             self.boosting_games = set(matched)
             txt = ("boosting " + ", ".join(sorted(matched))
                    + " - priority + timer + ultimate perf + unparked cores")
@@ -2908,6 +3064,7 @@ class CoolingApp:
         self.game_booster.release()
         self._restore_power_scheme()
         self._resume_services()
+        self._boost_tweaks(False)
         self.stop_components("Closing: overclock requests off")
         if self.cpu_oc_active:
             self.cpu_reset("Closing: restoring stock CPU ratio limit")
