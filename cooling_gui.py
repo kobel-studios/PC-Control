@@ -929,9 +929,9 @@ CLEANUP_PROTECTED = frozenset((
     "python", "pythonw", "cooling_gui", "code_verifier", "reopen_helper",
 ))
 CLEANUP_SAFE_CLOSE = frozenset((
-    # Media/browsers - restartable, tabs restore, no unsaved work.
-    "spotify", "opera", "operagx", "chrome", "msedge", "firefox", "brave",
-    "vivaldi", "robloxplayerbeta", "msedgewebview2",
+    # Media - restartable, no unsaved work. Browsers deliberately NOT here:
+    # the user's main browser may be in use mid-game, so browsers get asked.
+    "spotify", "robloxplayerbeta", "msedgewebview2",
     # Other game launchers/helpers - the running game only needs Steam itself.
     "epicgameslauncher", "steamwebhelper", "steamservice", "eadesktop",
     "ealauncher", "origin", "originwebhelperservice", "ubisoftconnect", "upc",
@@ -1561,7 +1561,7 @@ class CoolingApp:
         self.fps_cleanup_status.pack(anchor="w", padx=12, pady=(0, 4))
         ttk.Label(game, text="While a listed game runs: automatically closes background junk (browsers, launchers,\n"
             "sync tools, updaters, search indexing) that is eating CPU. It asks before closing anything that might\n"
-            "matter to you - 'always close'/'never' are remembered, 'leave it' just means not right now.",
+            "matter to you - including browsers - 'always close'/'never' are remembered, 'leave it' means not now.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
 
     def stop_components(self, reason):

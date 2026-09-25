@@ -29,6 +29,13 @@ class FpsCleanupTests(unittest.TestCase):
         self.app._cleanup_close.assert_called_once_with(111, "spotify")
         self.assertEqual(self.app.cleanup_queue, [])  # no confirmation needed
 
+    def test_browser_asks_not_autocloses(self):
+        # The main browser might be in use mid-game - ask, don't auto-close.
+        self.app.cleanup_candidates = [("opera", 444, 60.0), ("chrome", 445, 60.0)]
+        self.scan()
+        self.app._cleanup_close.assert_not_called()
+        self.assertEqual(len(self.app.cleanup_queue), 2)
+
     def test_uncertain_process_asks_once(self):
         self.app.cleanup_candidates = [("someapp", 222, 40.0)]
         self.scan()
