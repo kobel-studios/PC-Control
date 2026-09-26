@@ -900,7 +900,6 @@ ULTIMATE_SCHEME = "e9a42b02-d5df-448d-aa00-03f14749eb61"  # hidden on Win10; cre
 SUB_PROCESSOR = "54533251-82be-4824-96c1-47b60b740d00"      # powercfg subgroup
 CPMINCORES = "0cc5b647-c1df-4637-891a-dec35c318583"         # min cores unparked (%)
 PERFBOOSTMODE = "be337238-0d82-4146-a960-4f3749d470c7"      # boost aggressiveness (2 = Aggressive)
-IDLEDISABLE = "5d76a2ca-e8c0-402f-a133-2158492d58ad"        # disable C-states (1 = no idle)
 SUB_USB = "2a737441-1930-4402-8d77-b2bebba308a3"            # USB subgroup
 SUB_PCIEXPRESS = "501a4d13-42af-4429-9fd1-a8218c268e20"     # PCIe subgroup
 USB_SUSPEND = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"        # USB selective suspend
@@ -916,7 +915,6 @@ VIDEOIDLE = "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e"          # display off after
 BOOST_POWER_SETTINGS = {
     (SUB_PROCESSOR, CPMINCORES): "100",      # unpark all cores
     (SUB_PROCESSOR, PERFBOOSTMODE): "2",     # aggressive boost
-    (SUB_PROCESSOR, IDLEDISABLE): "1",       # no C-state sleep
     (SUB_USB, USB_SUSPEND): "0",             # no USB suspend latency
     (SUB_PCIEXPRESS, PCIE_ASPM): "0",        # no PCIe link power-saving
     (SUB_SLEEP, STANDBYIDLE): "0",           # never sleep mid-game
@@ -938,12 +936,6 @@ BOOST_PAUSE_TASKS = (
     r"\Microsoft\Windows\Defrag\ScheduledDefrag",
     r"\Microsoft\Windows\WindowsUpdate\Scheduled Start",
 )
-# TCP globals lowered for latency while boost is on; previous values restored.
-NETSH_TCP_OFF = {"chimney": "disabled", "ecncapability": "disabled",
-                 "timestamps": "disabled"}
-NETSH_TCP_LABELS = {"Chimney Offload State": "chimney",
-                    "ECN Capability": "ecncapability",
-                    "Timestamps": "timestamps"}
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 PROC_BOOST_RIGHTS = 0x0200 | 0x0100 | 0x1000  # SET_INFORMATION|SET_QUOTA|QUERY_LIMITED
 # Registry tweaks applied while Game Boost is on, restored when it's turned
@@ -976,9 +968,8 @@ TCPIP_IFACES = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
 APPCOMPAT_LAYERS = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
 STANDBY_PURGE_EVERY = 600.0  # seconds between standby-list purges while gaming
 
-# FPS cleanup: processes that must never be touched, and known non-essential
-# hogs that can be closed without asking (restartable, no unsaved work).
-CLEANUP_PROTECTED = frozenset((
+# Processes Game Boost must never deprioritize or otherwise touch.
+PROTECTED_PROCS = frozenset((
     "system", "registry", "smss", "csrss", "wininit", "winlogon", "services",
     "lsass", "svchost", "dwm", "fontdrvhost", "memory compression",
     "secure system", "system idle process", "idle", "consent", "sihost",
@@ -1007,29 +998,6 @@ CLEANUP_PROTECTED = frozenset((
     # stems below are this app and its helper tooling - never close them.
     "python", "pythonw", "cooling_gui", "code_verifier", "reopen_helper",
 ))
-CLEANUP_SAFE_CLOSE = frozenset((
-    # Media - restartable, no unsaved work. Browsers deliberately NOT here:
-    # the user's main browser may be in use mid-game, so browsers get asked.
-    "spotify", "robloxplayerbeta", "msedgewebview2",
-    # Other game launchers/helpers - the running game only needs Steam itself.
-    "epicgameslauncher", "steamwebhelper", "steamservice", "eadesktop",
-    "ealauncher", "origin", "originwebhelperservice", "ubisoftconnect", "upc",
-    "battle.net", "galaxyclient", "wegame", "riotclientservices",
-    # Cloud sync + update/telemetry junk - nothing user-facing is lost.
-    "onedrive", "dropbox", "googledrivefs", "updater", "crashpad",
-    "googleupdate", "adobearm", "jusched", "adobecollabsync", "ccxprocess",
-    "cclibrary", "adobegcclient", "adobeipcbroker", "core.sync",
-    "ituneshelper", "applemobiledeviceservice", "mdnsresponder", "bonjour",
-    "qtaudio", "obs-browser-page",
-    # Windows Search indexer - a classic background CPU hog during games;
-    # Windows restarts it on its own and nothing is lost by closing it.
-    "searchindexer", "searchprotocolhost", "searchfilterhost",
-))
-# Ask-first: could be in active use during a game (voice chat, etc.)
-# - discord*, overlays, recording/streaming tools land here naturally since
-#   they are not on the safe list and not protected.
-CLEANUP_CPU_MIN = 25.0  # PercentProcessorTime above this = worth closing
-CLEANUP_RECLOSE_AFTER = 120.0  # respawned apps can be closed again after this
 TIMER_RES_100NS = 5000  # 0.5 ms
 
 
@@ -1197,17 +1165,6 @@ class CoolingApp:
         self.game_exes_var = tk.StringVar(value="helldivers2.exe")
         self.game_booster = GameBooster()
         self.boosting_games = set()
-        self.fps_cleanup_value = tk.BooleanVar(value=False)
-        self.fps_cleanup_active = False
-        self.cleanup_last_scan = 0.0
-        self.cleanup_candidates = []
-        self.cleanup_asked = set()
-        self.cleanup_queue = []
-        self.cleanup_dialog = None
-        self.cleanup_closed = {}
-        self.cleanup_always = set()
-        self.cleanup_never = set()
-        self.cleanup_desc = {}
         self.running_procs = {}
         self.proc_last_scan = 0
         self.prev_power_scheme = None
@@ -1218,8 +1175,6 @@ class CoolingApp:
         self.compat_saved = {}
         self.compat_pids = set()
         self.paused_tasks = []
-        self.netsh_saved = {}
-        self.nic_power_saved = None
         self.depri_pids = set()
         self.gpu_fan_manual = False
         self.cpu_ratio_preset = CPU_OC_DEFAULT_RATIO
@@ -1281,12 +1236,6 @@ class CoolingApp:
                 self.cpu_ratio_preset = ratio
                 self.cpu_ratio_from_config = True
             self.game_boost_value.set(bool(cfg.get("game_boost", False)))
-            self.fps_cleanup_value.set(bool(cfg.get("fps_cleanup", False)))
-            for key, target in (("cleanup_always", self.cleanup_always),
-                                ("cleanup_never", self.cleanup_never)):
-                names = cfg.get(key)
-                if isinstance(names, str):
-                    target.update(n.strip().lower() for n in names.split(",") if n.strip())
             exes = cfg.get("game_exes")
             if isinstance(exes, str) and exes.strip():
                 self.game_exes_var.set(exes)
@@ -1315,9 +1264,6 @@ class CoolingApp:
                            "gpu_auto_preset": self.gpu_auto_preset,
                            "cpu_ratio_preset": self.cpu_ratio_preset,
                            "game_boost": self.game_boost_value.get(),
-                           "fps_cleanup": self.fps_cleanup_value.get(),
-                           "cleanup_always": ",".join(sorted(self.cleanup_always)),
-                           "cleanup_never": ",".join(sorted(self.cleanup_never)),
                            "game_exes": self.game_exes_var.get()}, f)
         except Exception:
             pass
@@ -1436,74 +1382,6 @@ class CoolingApp:
                         if len(row) >= 2 and row[1].isdigit():
                             procs.setdefault(row[0].lower(), []).append(int(row[1]))
                     self.running_procs = procs
-                except Exception:
-                    pass
-            if self.fps_cleanup_active and time.monotonic() - self.cleanup_last_scan >= 12:
-                self.cleanup_last_scan = time.monotonic()
-                try:
-                    out = subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         "Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | "
-                         "Where-Object {$_.PercentProcessorTime -gt 10} | "
-                         "Select-Object Name,IDProcess,PercentProcessorTime | ConvertTo-Csv -NoTypeInformation"],
-                        capture_output=True, text=True, timeout=15,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-                    rows = []
-                    for row in csv.DictReader(io.StringIO(out)):
-                        try:
-                            # WMI appends "#N" for repeated process names; strip it
-                            # so classification and remembered choices match by app.
-                            rows.append((row["Name"].strip().lower().split("#")[0],
-                                         int(row["IDProcess"]),
-                                         float(row["PercentProcessorTime"])))
-                        except (KeyError, ValueError):
-                            pass
-                    # python/pythonw processes all share a name - resolve each to
-                    # its script stem so the user sees e.g. "volume_guard_watcher"
-                    # instead of "python#1". Unresolved ones stay "python"/"pythonw".
-                    if any(name in ("python", "pythonw") for name, _, _ in rows):
-                        try:
-                            out2 = subprocess.run(
-                                ["powershell", "-NoProfile", "-Command",
-                                 "Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^pythonw?\\.exe$'} | "
-                                 "Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation"],
-                                capture_output=True, text=True, timeout=15,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-                            script_by_pid = {}
-                            for prow in csv.DictReader(io.StringIO(out2)):
-                                try:
-                                    cmd = prow.get("CommandLine") or ""
-                                    script = next((os.path.splitext(os.path.basename(t))[0]
-                                                   for t in cmd.split() if t.lower().endswith(".py")), None)
-                                    if script:
-                                        script_by_pid[int(prow["ProcessId"])] = script.lower()
-                                except (KeyError, ValueError):
-                                    pass
-                            if script_by_pid:
-                                rows = [(script_by_pid.get(pid, name), pid, cpu)
-                                        for name, pid, cpu in rows]
-                        except Exception:
-                            pass
-                    # Friendly "what is this" text for the ask dialog: the exe's
-                    # own file description (e.g. chrome -> "Google Chrome").
-                    if rows:
-                        try:
-                            out3 = subprocess.run(
-                                ["powershell", "-NoProfile", "-Command",
-                                 "Get-Process | Select-Object Id,Description | ConvertTo-Csv -NoTypeInformation"],
-                                capture_output=True, text=True, timeout=15,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-                            desc = {}
-                            for drow in csv.DictReader(io.StringIO(out3)):
-                                try:
-                                    if drow.get("Description"):
-                                        desc[int(drow["Id"])] = drow["Description"].strip()
-                                except (KeyError, ValueError):
-                                    pass
-                            self.cleanup_desc = desc
-                        except Exception:
-                            pass
-                    self.cleanup_candidates = rows
                 except Exception:
                     pass
             self.stop_flag.wait(1)
@@ -1686,23 +1564,10 @@ class CoolingApp:
                                            wraplength=720)
         self.game_boost_status.pack(anchor="w", padx=12, pady=(0, 4))
         ttk.Label(game, text="While a listed game runs: High CPU/I/O/memory priority, fast timer, standby purge,\n"
-            "Ultimate plan with cores unparked, aggressive boost, no idle sleep, and no sleep/disk/display/USB/PCIe\n"
-            "power saving. Background apps drop to low priority and give RAM back. Update/Search/telemetry/defrag\n"
-            "services and tasks pause; NIC power saving off. While boost is on: Game DVR off, Game Mode on, no\n"
-            "network throttling (Nagle/ECN/offload off), foreground CPU boost, best-performance visuals, and\n"
-            "exclusive-fullscreen compat for listed games. Everything restores when the game exits or boost is off.",
-            wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
-        crow = ttk.Frame(game)
-        crow.pack(fill="x", padx=8, pady=6)
-        ToggleSwitch(crow, text="FPS cleanup", variable=self.fps_cleanup_value,
-                     command=self.on_fps_cleanup_toggle).pack(side="left")
-        ttk.Button(crow, text="Reset choices", command=self.reset_cleanup_choices).pack(side="right")
-        self.fps_cleanup_status = ttk.Label(game, text="off - frees CPU for the listed game",
-                                            wraplength=720)
-        self.fps_cleanup_status.pack(anchor="w", padx=12, pady=(0, 4))
-        ttk.Label(game, text="While a listed game runs: automatically closes background junk (browsers, launchers,\n"
-            "sync tools, updaters, search indexing) that is eating CPU. It asks before closing anything that might\n"
-            "matter to you - including browsers - 'always close'/'never' are remembered, 'leave it' means not now.",
+            "Ultimate plan with cores unparked, aggressive boost, and no sleep/disk/display/USB/PCIe power saving.\n"
+            "Background apps drop to low priority and give RAM back. Update/Search/telemetry/defrag services and\n"
+            "tasks pause. While boost is on: Game DVR off, Game Mode on, Nagle off, foreground CPU boost,\n"
+            "best-performance visuals, and exclusive-fullscreen compat for listed games. All restored afterwards.",
             wraplength=720).pack(anchor="w", padx=12, pady=(0, 8))
 
     def stop_components(self, reason):
@@ -2592,7 +2457,6 @@ class CoolingApp:
             pass
         try:
             self.tick_game(time.monotonic())
-            self.tick_cleanup(time.monotonic())
         except Exception:
             pass
         try:
@@ -2652,18 +2516,11 @@ class CoolingApp:
         if not self.game_boost_value.get():
             self.boosting_games = set()
             self.game_booster.release()
-            self._restore_power_scheme()
-            self._resume_services()
-            self._resume_tasks()
             self._restore_background()
-            self._boost_tweaks(False)
-            self._netsh_tweaks(False)
-            self._nic_power(False)
+            threading.Thread(target=self._boost_exit, daemon=True).start()
             self.game_boost_status.config(text="off - boosts the listed game while it runs")
         else:
             self._boost_tweaks(True)
-            self._netsh_tweaks(True)
-            self._nic_power(True)
             self.game_boost_status.config(text="watching for a listed game...")
 
     def _reg_set(self, hive, path, name, val, kind="dword"):
@@ -2964,8 +2821,8 @@ class CoolingApp:
         k32 = self.game_booster.k32
         if not k32:
             return
-        protected = CLEANUP_PROTECTED | self.cleanup_never | self._cleanup_game_names()
-        for name, pids in self.running_procs.items():
+        protected = PROTECTED_PROCS | self._game_names()
+        for name, pids in list(self.running_procs.items()):
             if name in protected:
                 continue
             for pid in pids:
@@ -2999,67 +2856,26 @@ class CoolingApp:
                     k32.CloseHandle(h)
         self.depri_pids = set()
 
-    def _netsh_tweaks(self, on):
-        """TCP globals: offload/ECN/timestamps off while boosting for lower
-        packet latency. Previous values restored when boost is turned off."""
+    def _boost_enter(self):
+        """One-time boost steps on a worker thread - service/task pauses,
+        powercfg calls and registry tweaks can block for seconds and froze
+        the window when run inside tick()."""
         try:
-            if on:
-                if self.netsh_saved:
-                    return
-                out = subprocess.run(["netsh", "int", "tcp", "show", "global"],
-                                     capture_output=True, text=True, timeout=15,
-                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-                self.netsh_saved = {}
-                for label, key in NETSH_TCP_LABELS.items():
-                    m = re.search(re.escape(label) + r"\s*:\s*(\S+)", out, re.I)
-                    if m:
-                        self.netsh_saved[key] = m.group(1)
-                    subprocess.run(["netsh", "int", "tcp", "set", "global",
-                                    f"{key}={NETSH_TCP_OFF[key]}"],
-                                   capture_output=True, timeout=15,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            else:
-                for key, prev in self.netsh_saved.items():
-                    subprocess.run(["netsh", "int", "tcp", "set", "global",
-                                    f"{key}={prev}"],
-                                   capture_output=True, timeout=15,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                self.netsh_saved = {}
+            self._apply_power_scheme()
+            self._pause_services()
+            self._pause_tasks()
+            self._boost_tweaks(True)
         except Exception:
             pass
 
-    def _nic_power(self, off):
-        """Stop Windows power-managing physical NICs while boosting - adapter
-        power save can add latency. Only adapters that had it on get touched."""
-        if off:
-            if self.nic_power_saved is not None:
-                return
-            self.nic_power_saved = []
-            try:
-                out = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     "Get-CimInstance MSPower_DeviceEnable -Namespace root/wmi "
-                     "-ErrorAction SilentlyContinue | Where-Object {$_.Enable -and "
-                     "$_.InstanceName -match 'PCI\\\\VEN'} | ForEach-Object "
-                     "{$_.InstanceName; Set-CimInstance -InputObject $_ -Property @{Enable=$false}}"],
-                    capture_output=True, text=True, timeout=30,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-                self.nic_power_saved = [l.strip() for l in out.splitlines() if l.strip()]
-            except Exception:
-                pass
-        else:
-            for inst in self.nic_power_saved or []:
-                try:
-                    esc = inst.replace("'", "''")
-                    subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         "Get-CimInstance MSPower_DeviceEnable -Namespace root/wmi "
-                         f"-Filter \"InstanceName='{esc}'\" | Set-CimInstance -Property @{{Enable=$true}}"],
-                        capture_output=True, timeout=30,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                except Exception:
-                    pass
-            self.nic_power_saved = None
+    def _boost_exit(self):
+        try:
+            self._restore_power_scheme()
+            self._resume_services()
+            self._resume_tasks()
+            self._boost_tweaks(False)
+        except Exception:
+            pass
 
     def tick_game(self, now):
         enabled = self.game_boost_value.get()
@@ -3072,12 +2888,10 @@ class CoolingApp:
                     matched[name] = pids
         if matched:
             if not self.boosting_games:
-                self._apply_power_scheme()
-                self._pause_services()
-                self._pause_tasks()
-                self._boost_tweaks(True)
-                self._netsh_tweaks(True)
-                self._nic_power(True)
+                # The heavy one-time steps (services, tasks, power scheme,
+                # registry tweaks) run off the GUI thread - they block for
+                # seconds and froze the window when run inside tick().
+                threading.Thread(target=self._boost_enter, daemon=True).start()
             game_pids = [p for ps in matched.values() for p in ps]
             self.game_booster.apply(game_pids)
             self._compat_game_exes(game_pids)
@@ -3092,127 +2906,15 @@ class CoolingApp:
             if self.boosting_games or self.game_booster.timer_raised:
                 self.boosting_games = set()
                 self.game_booster.release()
-                self._restore_power_scheme()
-                self._resume_services()
-                self._resume_tasks()
                 self._restore_background()
+                threading.Thread(target=self._boost_exit, daemon=True).start()
             self.game_boost_status.config(
                 text="watching for a listed game..." if enabled
                 else "off - boosts the listed game while it runs")
 
-    def on_fps_cleanup_toggle(self):
-        self.save_config()
-        if not self.fps_cleanup_value.get():
-            self.fps_cleanup_active = False
-            self.fps_cleanup_status.config(text="off - frees CPU for the listed game")
-        else:
-            self.fps_cleanup_status.config(text="watching for a listed game...")
-
-    def reset_cleanup_choices(self):
-        self.cleanup_always.clear()
-        self.cleanup_never.clear()
-        self.cleanup_asked.clear()
-        self.save_config()
-        self.fps_cleanup_status.config(text="remembered close/never choices cleared")
-
-    def _cleanup_game_names(self):
+    def _game_names(self):
         return {n.strip().lower().removesuffix(".exe")
                 for n in self.game_exes_var.get().split(",") if n.strip()}
-
-    def tick_cleanup(self, now):
-        enabled = self.fps_cleanup_value.get()
-        gaming = bool(self.boosting_games)
-        self.fps_cleanup_active = bool(enabled and gaming)
-        if not enabled:
-            self.fps_cleanup_status.config(text="off - frees CPU for the listed game")
-            return
-        if not gaming:
-            # "Leave it" answers re-arm next session - some apps are wanted
-            # open sometimes but not every time.
-            self.cleanup_asked.clear()
-            self.fps_cleanup_status.config(text="watching for a listed game...")
-            return
-        protected = CLEANUP_PROTECTED | self.cleanup_never | self._cleanup_game_names()
-        closed = 0
-        for name, pid, cpu in list(self.cleanup_candidates):
-            if pid == os.getpid() or cpu < CLEANUP_CPU_MIN or name in protected:
-                continue
-            if name in self.cleanup_closed and now - self.cleanup_closed[name] < CLEANUP_RECLOSE_AFTER:
-                continue
-            if name in CLEANUP_SAFE_CLOSE or name in self.cleanup_always:
-                self._cleanup_close(pid, name)
-                closed += 1
-            elif name not in self.cleanup_asked:
-                self.cleanup_asked.add(name)
-                self.cleanup_queue.append((name, pid, cpu))
-        self._cleanup_next_ask()
-        if closed:
-            self.fps_cleanup_status.config(text=f"closed {closed} background hog(s) to free CPU")
-
-    def _cleanup_close(self, pid, name):
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T"],
-                           capture_output=True, timeout=10,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.cleanup_closed[name] = time.monotonic()
-            self.root.after(4000, lambda p=pid: self._cleanup_force(p))
-        except Exception:
-            pass
-
-    def _cleanup_force(self, pid):
-        try:
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                                 capture_output=True, text=True, timeout=10,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-            if str(pid) in out:
-                subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
-                               capture_output=True, timeout=10,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except Exception:
-            pass
-
-    def _cleanup_next_ask(self):
-        if self.cleanup_dialog is not None or not self.cleanup_queue:
-            return
-        name, pid, cpu = self.cleanup_queue.pop(0)
-        dlg = tk.Toplevel(self.root)
-        self.cleanup_dialog = dlg
-        dlg.title("FPS cleanup")
-        dlg.transient(self.root)
-        dlg.attributes("-topmost", True)
-        dlg.configure(bg="#1e1f24")
-        cpu_pct = min(100.0, cpu / max(1, os.cpu_count() or 1))
-        desc = self.cleanup_desc.get(pid, "").strip()
-        if desc.lower() in ("python", "pythonw"):
-            desc = "Python script"  # name is already the resolved script stem
-        shown = f"{desc} ({name})" if desc and desc.lower() != name else name
-        ttk.Label(dlg, text=f'"{shown}" is using about {cpu_pct:.0f}% of your CPU while your game is running.\n'
-                            "Close it to free resources?",
-                  wraplength=360).pack(padx=16, pady=(14, 8))
-        row = ttk.Frame(dlg)
-        row.pack(pady=(0, 14))
-
-        def choose(choice):
-            self.cleanup_dialog = None
-            dlg.destroy()
-            self._cleanup_choose(name, pid, choice)
-
-        for text, choice in (("Close once", "close"), ("Always close", "always"),
-                             ("Leave it", "skip"), ("Never ask", "never")):
-            ttk.Button(row, text=text, command=lambda c=choice: choose(c)).pack(side="left", padx=4)
-        dlg.protocol("WM_DELETE_WINDOW", lambda: choose("skip"))
-
-    def _cleanup_choose(self, name, pid, choice):
-        if choice in ("close", "always"):
-            if choice == "always":
-                self.cleanup_always.add(name)
-                self.save_config()
-            self._cleanup_close(pid, name)
-            self.fps_cleanup_status.config(text=f"closed {name} to free CPU")
-        elif choice == "never":
-            self.cleanup_never.add(name)
-            self.save_config()
-        self._cleanup_next_ask()
 
     def tick_gpu_fan(self):
         """Pin the GPU fan to 100% when hot; hand it back to auto when cool."""
@@ -3245,13 +2947,8 @@ class CoolingApp:
         if self.nvapi:
             self.nvapi.close()
         self.game_booster.release()
-        self._restore_power_scheme()
-        self._resume_services()
-        self._resume_tasks()
         self._restore_background()
-        self._boost_tweaks(False)
-        self._netsh_tweaks(False)
-        self._nic_power(False)
+        self._boost_exit()  # synchronous on close so restores complete
         self.stop_components("Closing: overclock requests off")
         if self.cpu_oc_active:
             self.cpu_reset("Closing: restoring stock CPU ratio limit")

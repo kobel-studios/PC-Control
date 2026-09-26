@@ -39,8 +39,8 @@ class GameBoostTests(unittest.TestCase):
         # exercise a step restore the real bound method from real_methods.
         self.real_methods = {}
         for m in ("_pause_services", "_resume_services", "_pause_tasks",
-                  "_resume_tasks", "_boost_tweaks", "_netsh_tweaks",
-                  "_nic_power", "_deprioritize_background", "_compat_game_exes"):
+                  "_resume_tasks", "_boost_tweaks", "_deprioritize_background",
+                  "_compat_game_exes"):
             self.real_methods[m] = getattr(self.app, m)
             setattr(self.app, m, Mock())
 
